@@ -14,8 +14,6 @@
  *  - Simple rate limiter: skip API and use fallback after 14 calls / 60 s.
  *  - Strip markdown fences from Gemini responses before JSON.parse.
  */
-console.log("API KEY:", import.meta.env.VITE_GROQ_API_KEY);
-console.log("API AVAILABLE:", isApiAvailable());
 import { formatNumber, formatPercent } from "./analysisOps.js";
 
 /* ═══════════════════════════════════════════════════════════
@@ -46,17 +44,40 @@ function _reserveApiCall() {
    §1  UTILITY HELPERS
 ═══════════════════════════════════════════════════════════ */
 
-/** Strip ```json ... ``` or ``` ... ``` fences Gemini sometimes wraps JSON in. */
+/**
+ * Extract JSON from an LLM response that may contain markdown fences, prose, or both.
+ * Tries:
+ *  1. Strip ```json...``` fences
+ *  2. Find first { … } or [ … ] block via greedy regex
+ *  3. Return cleaned text as-is (caller will try JSON.parse)
+ */
 function stripMarkdownFences(text) {
-  return text
+  // 1. Strip triple-backtick fences
+  let cleaned = text
     .replace(/^```[a-z]*\s*/i, "")
     .replace(/\s*```\s*$/i, "")
     .trim();
+
+  // 2. If result still doesn't start with { or [, try to extract the JSON object
+  if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
+    const match = cleaned.match(/(\{[\s\S]*\})/);
+    if (match) cleaned = match[1];
+  }
+
+  return cleaned;
 }
 
-/** Low-level Gemini POST — throws on HTTP error or missing candidates. */
-async function _callGemini(prompt) {
+/**
+ * Low-level Groq POST — uses proper system/user message roles.
+ * @param {string} prompt     — user prompt text
+ * @param {string} [system]   — optional system prompt (sent as role:"system")
+ */
+async function _callGemini(prompt, system = null) {
   const apiKey = import.meta.env.VITE_GROQ_API_KEY;
+
+  const messages = [];
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: prompt });
 
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -66,15 +87,14 @@ async function _callGemini(prompt) {
     },
     body: JSON.stringify({
       model: "llama-3.1-8b-instant",
-      messages: [
-        { role: "user", content: prompt }
-      ],
+      messages,
       temperature: 0.1,
     }),
   });
 
   if (!response.ok) {
     const errText = await response.text().catch(() => response.statusText);
+    // On 429 rate-limit, throw with specific message so callers can handle
     throw new Error(`Groq API ${response.status}: ${errText}`);
   }
 
@@ -158,6 +178,7 @@ Rules:
 - sentiment → use sentimentScan on customer_feedback; chartType: pie
 - summary → use summarize with relevant columns; chartType: bar
 - anomaly → use anomaly with metricCol; chartType: table
+- ranking direction: "max", "maximum", "highest", "best", "most", "top" → direction:"top"; "min", "minimum", "lowest", "worst", "least", "bottom" → direction:"bottom". NEVER flip these.
 - For "last month" use the most recent time period in the data; for "this quarter" use Q4
 - For follow-up questions, use conversation context to fill in implicit dataset or columns`;
 
@@ -178,9 +199,7 @@ export async function parseQuery(question, registryMetadata, conversationContext
   const registryText = _buildRegistryText(registryMetadata);
   const contextText = _buildContextText(conversationContext);
 
-  const prompt = `${PARSE_QUERY_SYSTEM}
-
-Available datasets:
+  const prompt = `Available datasets:
 ${registryText}
 
 Previous conversation:
@@ -189,7 +208,7 @@ ${contextText}
 User question: "${question}"`;
 
   try {
-    const raw = await _callGemini(prompt);
+    const raw = await _callGemini(prompt, PARSE_QUERY_SYSTEM);
     const json = JSON.parse(stripMarkdownFences(raw));
     return _normalizePlan(json);
   } catch (err) {
@@ -203,15 +222,29 @@ User question: "${question}"`;
 ═══════════════════════════════════════════════════════════ */
 
 const NARRATIVE_SYSTEM = `You are a data analyst explaining results to a non-technical business user.
+
+You MUST structure EVERY response using exactly these four sections. Use the exact emoji headers:
+
+✅ Final Answer
+(1–3 plain sentences. State the key finding directly with specific numbers. No jargon.)
+
+📊 Key Insight
+(1–2 sentences. Explain the main driver, pattern, or reason behind the result. Include % change or comparison where relevant.)
+
+📁 Data Reference
+(Single line. List the exact column names or fields used to reach this answer.)
+
+⚠️ Notes
+(Any assumptions made, data limitations, or caveats. If none, write “None.”)
+
 Rules:
-- Be concise: 2-4 sentences maximum.
-- Use specific numbers from the results.
-- Mention the data source.
-- Highlight the most important finding first.
-- If there's a notable pattern (concentration, outlier, sharp change), call it out explicitly.
-- Use plain language, no jargon.
-- Do NOT say "based on the data" or "according to the analysis" — just state the findings directly.
-- Format numbers with commas for readability (e.g., 12,500 not 12500).`;
+- Use SPECIFIC numbers from the results with commas for readability (e.g., 12,500 not 12500).
+- Do NOT hedge with “based on the data” or “according to the analysis” — state findings directly.
+- Do NOT skip any section.
+- Keep each section SHORT — no walls of text.
+- Plain language only — no SQL, no code, no technical jargon.
+- If a comparison is made, always state the % change or absolute difference.
+- If the query was ambiguous, state the assumption you made in ⚠️ Notes.`;
 
 /**
  * Generate a 2-4 sentence plain-English narrative for analysis results.
@@ -235,9 +268,7 @@ export async function generateNarrative(analysisResults, question, metricDefinit
     .map((d) => `${d.name}: ${d.def}`)
     .join("; ");
 
-  const prompt = `${NARRATIVE_SYSTEM}
-
-User question: "${question}"
+  const prompt = `User question: "${question}"
 Analysis method: ${metadata?.method ?? "unknown"}
 Columns analyzed: ${(metadata?.columnsUsed ?? []).join(", ")}
 Rows processed: ${metadata?.rowsAnalyzed ?? "unknown"}
@@ -249,7 +280,7 @@ ${resultSummary}
 Write the narrative:`;
 
   try {
-    const text = await _callGemini(prompt);
+    const text = await _callGemini(prompt, NARRATIVE_SYSTEM);
     return text.trim();
   } catch (err) {
     console.warn("[geminiApi] generateNarrative fell back to local:", err.message);
@@ -261,10 +292,18 @@ Write the narrative:`;
 function _buildResultSummary(result, metadata) {
   if (!result) return "(no results)";
 
-  // sentimentScan
+  // sentimentScan — include groupRanking winner so Groq can name the specific group
   if (result?.counts) {
     const c = result.counts;
-    return `Sentiment counts — Positive: ${c.positive}, Negative: ${c.negative}, Neutral: ${c.neutral}, Total: ${c.total}`;
+    let summary = `Sentiment counts — Positive: ${c.positive}, Negative: ${c.negative}, Neutral: ${c.neutral}, Total: ${c.total}`;
+    if (result.groupRanking && result.groupRanking.length > 0) {
+      const worst = result.groupRanking[0];
+      const best  = result.groupRanking[result.groupRanking.length - 1];
+      summary += `\nGroup ranking (worst to best): ${result.groupRanking.map((g) => `${g.group}(neg:${g.negativeRate}%,pos:${g.positiveRate}%)`).join(", ")}`;
+      summary += `\nWorst group: "${worst.group}" (${worst.negativeRate}% negative, ${worst.negative} negative entries)`;
+      summary += `\nBest group: "${best.group}" (${best.positiveRate}% positive, ${best.positive} positive entries)`;
+    }
+    return summary;
   }
   // compare
   if (result?.groups && result?.comparisons) {
@@ -298,6 +337,41 @@ function _buildResultSummary(result, metadata) {
    §5  fallbackParseQuery  (LOCAL — no API)
 ═══════════════════════════════════════════════════════════ */
 
+/* ── Column synonym map: user term → actual column name ── */
+const COLUMN_SYNONYMS = {
+  sales:         "revenue",
+  income:        "revenue",
+  earnings:      "revenue",
+  profit:        "revenue",
+  users:         "active_users",
+  "active users": "active_users",
+  customers:     "active_users",
+  attrition:     "churn",
+  "churn rate":  "churn",
+  cancellations: "churn",
+  "sign ups":    "signups",
+  "new users":   "signups",
+  registrations: "signups",
+  spend:         "ad_spend",
+  spending:      "ad_spend",
+  advertising:   "ad_spend",
+  expenses:      "cost",
+  costs:         "cost",
+  employees:     "headcount",
+  staff:         "headcount",
+  "team size":   "headcount",
+  satisfaction:  "nps",
+  "handle time": "avg_handle_time",
+  response:      "resolution_rate",
+  period:        "month",
+  time:          "month",
+};
+
+/** Map a user-provided term to an actual column name using synonyms. */
+function _synonymResolve(term) {
+  return COLUMN_SYNONYMS[term.toLowerCase()] ?? null;
+}
+
 /* ── Intent keyword tables ── */
 const INTENT_RULES = [
   // text_search must come first — most specific
@@ -311,9 +385,11 @@ const INTENT_RULES = [
       /\bcomplaints\b/,
       /\bwhat are customers/i,
       /\bcustomers say/i,
-      /\bfeedback\b/,           // catches "worst feedback", "best feedback"
+      /\bfeedback\b/,
       /\breviews?\b/i,
-      /worst.*month/i,          // "worst month for feedback"
+      /\bunhappy\b/i,
+      /\bdissatisfied\b/i,
+      /worst.*month/i,
       /best.*month/i,
       /month.*worst/i,
       /month.*best/i,
@@ -321,14 +397,46 @@ const INTENT_RULES = [
       /which month.*good/i,
     ],
   },
-  { intent: "computed_metric", patterns: [/profit margin/i, /cost per/i, /per unit/i, /\bratio\b/i, /\befficiency\b/i, /\brate\b.*per/i] },
+  // computed_metric: explicit rate / margin / per-unit
+  { intent: "computed_metric", patterns: [
+    /profit margin/i, /cost per/i, /per unit/i, /\bratio\b/i, /\befficiency\b/i, /\brate\b.*per/i,
+    /churn rate/i, /return rate/i, /attrition rate/i, /conversion rate/i,
+  ] },
   { intent: "anomaly", patterns: [/\banomal/i, /\bunusual\b/i, /\boutlier/i, /\bspike\b/i, /\babnormal\b/i, /\bflag\b/i] },
-  { intent: "correlation", patterns: [/\bcorrelat/i, /relationship between/i, /\brelated to\b/i, /\bimpact on\b/i] },
-  { intent: "trend", patterns: [/\bwhy\b.*change/i, /\bwhy\b.*drop/i, /\bwhy\b.*increase/i, /\btrend\b/i, /\bchanged\b/i, /\bdrop(ped)?\b/i, /\bincreas/i, /\brise\b|\brose\b/i, /\bwhat happened/i, /\bcause\b/i, /\breason\b/i, /over time/i] },
+  { intent: "correlation", patterns: [/\bcorrelat/i, /relationship between/i, /\brelated to\b/i, /\bimpact on\b/i, /\bcontribut/i, /what drives/i, /what causes/i, /what affects/i] },
+  { intent: "trend", patterns: [
+    /\bwhy\b.*change/i, /\bwhy\b.*drop/i, /\bwhy\b.*increase/i,
+    /\btrend\b/i, /\bchanged\b/i, /\bdrop(ped)?\b/i, /\bincreas/i,
+    /\brise\b|\brose\b/i, /\bwhat happened/i, /\bcause\b/i, /\breason\b/i,
+    /over time/i,
+    // ─ "every month/week", "per month/week", "each month" ─
+    /every (month|week|day)/i, /per (month|week|day)/i, /each (month|week)/i,
+    /month[- ]by[- ]month/i, /week[- ]by[- ]week/i,
+    /\bmonthly\b/i, /\bweekly\b/i,
+    // churn/NPS/metric over time
+    /nps.*over/i, /over.*month/i, /over.*week/i,
+    // "how is X trending", "how did X change"
+    /how (is|did|has)\b/i,
+  ] },
   { intent: "comparison", patterns: [/\bcompare\b/i, /\bvs\b\.?/i, /\bversus\b/i, /difference between/i, /\bagainst\b/i] },
-  { intent: "breakdown", patterns: [/\bbreakdown\b/i, /\bbreak down\b/i, /what makes up/i, /\bcomposition\b/i, /by (department|region|product|channel|category)/i, /\bdistribution\b/i, /\bsplit\b/i, /\bshare\b/i] },
-  { intent: "ranking", patterns: [/\btop \d/i, /\bbottom \d/i, /\bhighest\b/i, /\blowest\b/i, /\bbest\b/i, /\bworst\b/i, /\brank/i, /\bmost\b/i, /\bleast\b/i] },
-  { intent: "summary", patterns: [/\bsummar/i, /\boverview\b/i, /\bhighlights\b/i, /what.?s happening/i, /\bupdate\b/i, /\bbrief\b/i, /\bhow are we doing\b/i] },
+  { intent: "breakdown", patterns: [
+    /\bbreakdown\b/i, /\bbreak down\b/i, /what makes up/i, /\bcomposition\b/i,
+    /by (department|region|product|channel|category)/i,
+    /\bdistribution\b/i, /\bsplit\b/i, /\bshare\b/i,
+  ] },
+  { intent: "ranking", patterns: [
+    /\btop \d/i, /\bbottom \d/i, /\bhighest\b/i, /\blowest\b/i,
+    /\bbest\b/i, /\bworst\b/i, /\brank/i, /\bmost\b/i, /\bleast\b/i,
+    /\bmax\b/i, /\bmin\b/i, /\bmaximum\b/i, /\bminimum\b/i,
+    /which.*most/i, /which.*least/i, /which.*max/i, /which.*min/i,
+    /who.*most/i, /who.*least/i, /who.*highest/i, /who.*lowest/i,
+  ] },
+  // aggregate: explicit total/average/sum/count
+  { intent: "aggregate", patterns: [
+    /\btotal\b/i, /\baverage\b/i, /\bsum\b/i, /\bmean\b/i,
+    /how much\b/i, /how many\b/i, /what is the\b.*\b(revenue|cost|churn|signups|units|headcount)/i,
+  ] },
+  { intent: "summary", patterns: [/\bsummar/i, /\boverview\b/i, /\bhighlights\b/i, /what.?s happening/i, /\bupdate\b/i, /\bbrief\b/i, /\bhow are we doing\b/i, /recent performance/i] },
 ];
 
 /** Detect intent from the question using ordered keyword rules. Returns "summary" as default. */
@@ -398,12 +506,29 @@ function _pickDataset(question, registryMetadata, intent) {
   return scored[0]?.ds ?? registryMetadata[0];
 }
 
-/** Find which columns from a dataset are mentioned in the question (case-insensitive). */
+/**
+ * Find which columns from a dataset are mentioned in the question.
+ * Uses both exact column name matching AND synonyms.
+ */
 function _findMentionedColumns(question, dataset) {
   const lower = question.toLowerCase();
-  return (dataset?.columns ?? [])
-    .filter((c) => lower.includes(c.name.toLowerCase()))
-    .map((c) => c.name);
+  const cols = dataset?.columns ?? [];
+  const found = new Set();
+
+  // 1. Direct column name match
+  for (const c of cols) {
+    if (lower.includes(c.name.toLowerCase())) found.add(c.name);
+  }
+
+  // 2. Synonym match: if user says "sales", map to "revenue" if it exists
+  for (const [synonym, colName] of Object.entries(COLUMN_SYNONYMS)) {
+    if (lower.includes(synonym)) {
+      const match = cols.find((c) => c.name.toLowerCase() === colName.toLowerCase());
+      if (match) found.add(match.name);
+    }
+  }
+
+  return [...found];
 }
 
 /** Return the first column of a given type from a dataset. */
@@ -416,10 +541,20 @@ function _colsOfType(dataset, type) {
   return (dataset?.columns ?? []).filter((c) => c.type === type).map((c) => c.name);
 }
 
-/** Extract a number N from "top 5", "bottom 3" etc. */
+/**
+ * Extract a number N from "top 5", "bottom 3" etc.
+ * For max/min/maximum/minimum without explicit N, default to 1 (user wants THE max).
+ */
 function _extractN(question, defaultN = 5) {
   const m = question.match(/\b(top|bottom)\s+(\d+)\b/i);
-  return m ? parseInt(m[2], 10) : defaultN;
+  if (m) return parseInt(m[2], 10);
+  // "max" / "min" / "maximum" / "minimum" without an explicit N → user wants 1 row
+  if (/\b(max|min|maximum|minimum)\b/i.test(question)
+    && !/\btop\s+\d/i.test(question)
+    && !/\bbottom\s+\d/i.test(question)) {
+    return 1;
+  }
+  return defaultN;
 }
 
 /** Choose chart type for an intent. */
@@ -435,6 +570,7 @@ function _chartForIntent(intent) {
     text_search: "table",
     sentiment: "pie",
     correlation: "table",
+    aggregate: "bar",
   };
   return map[intent] ?? "table";
 }
@@ -454,6 +590,7 @@ function _makeTitle(intent, dataset, columns) {
     computed_metric: `Computed: ${cols}`,
     text_search: `Feedback Search`,
     sentiment: `Sentiment Analysis`,
+    aggregate: `${cols} Total`,
   };
   return labels[intent] ?? `${ds} Analysis`;
 }
@@ -498,19 +635,48 @@ function _buildOperations(intent, question, dataset) {
         ? [{ function: "breakdown", params: { metricCol: primaryMetric, groupCol: primaryGroup } }]
         : [{ function: "aggregate", params: { metricCol: requireCol(primaryMetric ?? numericCols[0], "metric"), groupCol: primaryGroup, aggType: "sum" } }];
 
-    case "comparison":
+    case "comparison": {
       if (isTextOnly) {
         return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text", groupCol: primaryGroup } }];
       }
+      const lower = question.toLowerCase();
+
       // Detect column-series comparison: e.g. "compare Q1, Q2, Q3, Q4"
-      {
-        const quarterCols = numericCols.filter((c) => /^Q[1-4]$/i.test(c));
-        const asksAboutQuarter = /\bquarter\b|\bQ[1-4]\b/i.test(question);
-        if (quarterCols.length > 1 && asksAboutQuarter) {
-          return [{ function: "rankColumns", params: { columns: quarterCols, direction: "top" } }];
-        }
+      const quarterCols = numericCols.filter((c) => /^Q[1-4]$/i.test(c));
+      const asksAboutQuarter = /\bquarter\b|\bQ[1-4]\b/i.test(question);
+      if (quarterCols.length > 1 && asksAboutQuarter) {
+        return [{ function: "rankColumns", params: { columns: quarterCols, direction: "top" } }];
       }
+
+      // Detect temporal comparison: "week by week", "month by month", "compare X over time"
+      const isTemporal = /week[- ]by[- ]week|month[- ]by[- ]month|over time|every (week|month)|per (week|month)|\bweekly\b|\bmonthly\b/i.test(lower);
+      if (isTemporal && timeCol) {
+        return [{
+          function: "trend",
+          params: {
+            timeCol: timeCol,
+            metricCol: requireCol(primaryMetric ?? numericCols[0], "metric"),
+            groupCol: null,
+          },
+        }];
+      }
+
+      // Detect specific period comparison: "Jan vs Feb", "W1 vs W2"
+      const vsMatch = lower.match(/(\w[\w\s]*?)\s+vs\.?\s+(\w[\w\s]*?)(?:\s|$)/i);
+      if (vsMatch && timeCol) {
+        return [{
+          function: "trend",
+          params: {
+            timeCol: timeCol,
+            metricCol: requireCol(primaryMetric ?? numericCols[0], "metric"),
+            groupCol: null,
+          },
+        }];
+      }
+
+      // Default: compare groups across metrics
       return [{ function: "compare", params: { groupCol: primaryGroup, metricCols: numericCols.slice(0, 3) } }];
+    }
 
     case "trend": {
       if (isTextOnly) {
@@ -538,10 +704,12 @@ function _buildOperations(intent, question, dataset) {
       const quarterCols = numericCols.filter((c) => /^Q[1-4]$/i.test(c));
       const asksAboutQuarter = /\bquarter\b|\bQ[1-4]\b/i.test(question);
       if (quarterCols.length > 1 && asksAboutQuarter) {
-        const isBottom = /\bworst\b|\blowest\b|\bbottom\b|\bleast\b/i.test(question);
-        return [{ function: "rankColumns", params: { columns: quarterCols, direction: isBottom ? "bottom" : "top" } }];
+        const isQBottom = /\bworst\b|\blowest\b|\bbottom\b|\bleast\b|\bmin\b|\bminimum\b/i.test(question);
+        return [{ function: "rankColumns", params: { columns: quarterCols, direction: isQBottom ? "bottom" : "top" } }];
       }
-      const isBottom = /\bbottom\b|\blowest\b|\bworst\b|\bleast\b/i.test(question);
+      // max/maximum → top (highest), min/minimum/lowest/worst → bottom
+      const isBottom = /\bbottom\b|\blowest\b|\bworst\b|\bleast\b|\bmin\b|\bminimum\b/i.test(question)
+                    && !/\bmax\b|\bmaximum\b|\bhighest\b|\bbest\b|\btop\b/i.test(question);
       return [{
         function: "topN",
         params: {
@@ -558,33 +726,79 @@ function _buildOperations(intent, question, dataset) {
       }
       return [{ function: "anomaly", params: { metricCol: requireCol(primaryMetric ?? numericCols[0], "metric"), threshold: 20 } }];
 
-    case "correlation":
+    case "correlation": {
       if (isTextOnly || numericCols.length < 2) {
         return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text" } }];
       }
+      const col1 = primaryMetric ?? numericCols[0];
+      const col2 = mentioned.find((c) =>
+        c !== col1 && numericCols.includes(c)
+      ) ?? numericCols.find((c) => c !== col1) ?? numericCols[1];
       return [{
         function: "correlation",
-        params: { col1: numericCols[0], col2: numericCols[1] },
+        params: { col1, col2 },
       }];
+    }
 
     case "computed_metric": {
       if (isTextOnly) {
         return [{ function: "summarize", params: { columns: [] } }];
       }
-      const isMargin = /margin/i.test(question);
-      const formulas = {
-        default: { operation: "subtract", left: requireCol(numericCols[0], "first numeric"), right: requireCol(numericCols[1], "second numeric") },
-        margin: {
-          operation: "ratio",
-          numerator: { operation: "subtract", left: "Revenue", right: "Cost" },
-          denominator: "Revenue",
-        },
-      };
+      const lower = question.toLowerCase();
+
+      // Auto-detect common rate formulas
+      const isChurnRate  = /churn rate|attrition rate/i.test(lower);
+      const isReturnRate = /return rate/i.test(lower);
+      const isMargin     = /margin/i.test(lower);
+
+      if (isChurnRate) {
+        const hasChurn = numericCols.some((c) => c.toLowerCase() === "churn");
+        const hasUsers = numericCols.some((c) => c.toLowerCase() === "active_users");
+        if (hasChurn && hasUsers) {
+          return [{
+            function: "computeMetric",
+            params: {
+              formula: { operation: "ratio", numerator: "churn", denominator: "active_users" },
+              resultName: "Churn Rate (%)",
+              groupCol: timeCol ?? primaryGroup,
+            },
+          }];
+        }
+      }
+      if (isReturnRate) {
+        const hasReturns = numericCols.some((c) => c.toLowerCase() === "returns");
+        const hasUnits   = numericCols.some((c) => c.toLowerCase() === "units");
+        if (hasReturns && hasUnits) {
+          return [{
+            function: "computeMetric",
+            params: {
+              formula: { operation: "ratio", numerator: "returns", denominator: "units" },
+              resultName: "Return Rate (%)",
+              groupCol: timeCol ?? primaryGroup,
+            },
+          }];
+        }
+      }
+      if (isMargin) {
+        return [{
+          function: "computeMetric",
+          params: {
+            formula: {
+              operation: "ratio",
+              numerator: { operation: "subtract", left: "revenue", right: "cost" },
+              denominator: "revenue",
+            },
+            resultName: "Profit Margin",
+            groupCol: primaryGroup,
+          },
+        }];
+      }
+
       return [{
         function: "computeMetric",
         params: {
-          formula: isMargin ? formulas.margin : formulas.default,
-          resultName: isMargin ? "Profit Margin" : "Computed Metric",
+          formula: { operation: "subtract", left: requireCol(numericCols[0], "first numeric"), right: requireCol(numericCols[1], "second numeric") },
+          resultName: "Computed Metric",
           groupCol: primaryGroup,
         },
       }];
@@ -597,16 +811,51 @@ function _buildOperations(intent, question, dataset) {
       return [{ function: "searchText", params: { textCol, query: queryStr } }];
     }
 
-    case "sentiment":
-      // groupCol allows temporal / regional breakdown of sentiment
-      return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text", groupCol: timeCol ?? primaryGroup } }];
+    case "sentiment": {
+      // Prefer explicit region/location/category in the question as groupCol.
+      // Fall back to timeCol for "which month had worst feedback" style questions.
+      const lower = question.toLowerCase();
+      const prefersRegion = /\bregion\b|\blocation\b|\barea\b|\bcity\b|\bcountry\b|\bstate\b|\bzone\b/i.test(lower);
+      const prefersCat    = catCols.find((c) => lower.includes(c.toLowerCase()) && c.toLowerCase() !== "channel");
+
+      let sentGroupCol;
+      if (prefersRegion) {
+        // pick the cat column most likely to be region
+        sentGroupCol = catCols.find((c) => /region|location|area|zone/i.test(c)) ?? catCols.find((c) => c !== timeCol);
+      } else if (prefersCat) {
+        sentGroupCol = prefersCat;
+      } else {
+        sentGroupCol = timeCol ?? primaryGroup;
+      }
+
+      return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text", groupCol: sentGroupCol } }];
+    }
+
+    case "aggregate": {
+      if (isTextOnly) {
+        return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text" } }];
+      }
+      const lower = question.toLowerCase();
+      let aggType = "sum";
+      if (/\baverage\b|\bavg\b|\bmean\b/i.test(lower)) aggType = "avg";
+      else if (/\bhow many\b|\bcount\b/i.test(lower)) aggType = "count";
+
+      return [{
+        function: "aggregate",
+        params: {
+          metricCol: requireCol(primaryMetric ?? numericCols[0], "metric"),
+          groupCol: primaryGroup !== primaryMetric ? primaryGroup : null,
+          aggType,
+        }
+      }];
+    }
 
     case "summary":
     default:
       if (isTextOnly) {
         return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text" } }];
       }
-      return [{ function: "summarize", params: { columns: numericCols.slice(0, 4) } }];
+      return [{ function: "summarize", params: { columns: numericCols.slice(0, 6) } }];
   }
 }
 
@@ -649,6 +898,24 @@ export function fallbackParseQuery(question, registryMetadata) {
 const _get = (obj, key) => obj?.[key] ?? obj?.[Object.keys(obj ?? {}).find((k) => k.toLowerCase() === key?.toLowerCase())] ?? null;
 
 /**
+ * Wrap a plain narrative string into the 4-section structured format.
+ * Used by fallbackNarrative and the Groq narrative post-processor.
+ *
+ * @param {string} finalAnswer  — the core 1-3 sentence answer
+ * @param {string} keyInsight   — main driver or pattern
+ * @param {string} dataRef      — comma-separated column/field names used
+ * @param {string} notes        — assumptions or caveats (or "None.")
+ */
+function _wrapStructured(finalAnswer, keyInsight, dataRef, notes) {
+  return [
+    `✅ **Final Answer**\n${finalAnswer}`,
+    `📊 **Key Insight**\n${keyInsight}`,
+    `📁 **Data Reference**\n${dataRef}`,
+    `⚠️ **Notes**\n${notes || "None."}`,
+  ].join("\n\n");
+}
+
+/**
  * Template-based narrative generator — fully offline.
  * Infers the result type from the result shape and metadata.method.
  *
@@ -659,10 +926,22 @@ const _get = (obj, key) => obj?.[key] ?? obj?.[Object.keys(obj ?? {}).find((k) =
 export function fallbackNarrative(analysisResults, question) {
   const { result, metadata } = analysisResults ?? {};
   const method = metadata?.method ?? "";
+  const colsUsed = (metadata?.columnsUsed ?? []).join(", ") || "unknown fields";
+  const rows = metadata?.rowsAnalyzed ?? "?";
 
-  if (!result) return "No results were returned for this query.";
+  if (!result) return _wrapStructured(
+    "No results were returned for this query.",
+    "The analysis could not produce a result.",
+    colsUsed,
+    "Try rephrasing your question or checking available datasets."
+  );
   if (Array.isArray(result) && result.length > 0 && result[0]?.error) {
-    return result[0].error;
+    return _wrapStructured(
+      result[0].error,
+      "The requested column or operation could not be completed.",
+      colsUsed,
+      "Check that the column name exists in the dataset."
+    );
   }
 
   /* ── sentimentScan: { counts, groups, groupRanking? } ── */
@@ -676,7 +955,6 @@ export function fallbackNarrative(analysisResults, question) {
                  : c.negative > c.positive ? "predominantly negative"
                  : "mixed";
 
-    // If we have groupRanking, answer the "which month was worst" question directly
     const ranking = result.groupRanking;
     if (ranking && ranking.length > 0) {
       const worst = ranking[0];
@@ -684,27 +962,39 @@ export function fallbackNarrative(analysisResults, question) {
       const isWorstQ = /worst|bad|negative|complain/i.test(question);
       const isBestQ  = /best|good|positive|happy|satisf/i.test(question);
 
-      let narrative = "";
+      let finalAnswer = "";
+      let keyInsight  = "";
+
       if (isWorstQ && !isBestQ) {
-        narrative = `**${worst.group}** had the worst feedback with ${worst.negativeRate}% negative sentiment (${worst.negative} negative out of ${worst.total} entries, net score: ${worst.netScore}).`;
-        if (ranking.length > 1) {
-          const second = ranking[1];
-          narrative += ` **${second.group}** was second worst at ${second.negativeRate}% negative.`;
-        }
+        finalAnswer = `**${worst.group}** had the worst feedback — ${worst.negativeRate}% negative sentiment (${worst.negative} of ${worst.total} entries).`;
+        keyInsight  = ranking.length > 1
+          ? `**${ranking[1].group}** was second worst at ${ranking[1].negativeRate}% negative. Overall sentiment is ${tone} (${posPct}% positive, ${negPct}% negative).`
+          : `Overall sentiment is ${tone}: ${posPct}% positive, ${negPct}% negative, ${neuPct}% neutral.`;
       } else if (isBestQ && !isWorstQ) {
-        narrative = `**${best.group}** had the best feedback with ${best.positiveRate}% positive sentiment (${best.positive} positive out of ${best.total} entries).`;
+        finalAnswer = `**${best.group}** had the best feedback — ${best.positiveRate}% positive sentiment (${best.positive} of ${best.total} entries).`;
+        keyInsight  = `Overall sentiment is ${tone}: ${posPct}% positive, ${negPct}% negative, ${neuPct}% neutral across all ${total} entries.`;
       } else {
-        // General ranking
-        narrative = `Sentiment breakdown by period:\n`;
-        narrative += ranking
-          .map((g) => `• **${g.group}**: ${g.negativeRate}% negative, ${g.positiveRate}% positive (${g.total} entries)`)
-          .join("\n");
+        const rankSummary = ranking.slice(0, 3)
+          .map((g) => `${g.group}: ${g.negativeRate}% negative, ${g.positiveRate}% positive`)
+          .join(" | ");
+        finalAnswer = `Sentiment breakdown across periods. Overall: ${tone} — ${posPct}% positive, ${negPct}% negative, ${neuPct}% neutral.`;
+        keyInsight  = rankSummary;
       }
-      narrative += `\n\nOverall across all ${total} entries: ${tone} — ${posPct}% positive, ${negPct}% negative, ${neuPct}% neutral.`;
-      return narrative;
+
+      return _wrapStructured(
+        finalAnswer,
+        keyInsight,
+        colsUsed,
+        `Based on ${total} feedback entries. Sentiment scored using keyword matching.`
+      );
     }
 
-    return `Sentiment across ${total} feedback entries is ${tone}: ${posPct}% positive, ${negPct}% negative, and ${neuPct}% neutral.`;
+    return _wrapStructured(
+      `Sentiment across ${total} feedback entries is **${tone}**: ${posPct}% positive, ${negPct}% negative, and ${neuPct}% neutral.`,
+      `${c.positive} positive entries vs ${c.negative} negative entries. ${neuPct}% were neutral or ambiguous.`,
+      colsUsed,
+      "Sentiment scored using keyword matching — not a trained NLP model."
+    );
   }
 
   /* ── rankColumns: [{ name, total, rank }] ── */
@@ -713,26 +1003,41 @@ export function fallbackNarrative(analysisResults, question) {
     const second = result[1];
     const isWorstQ = /worst|lowest|bottom|least/i.test(question);
     const label  = isWorstQ ? "lowest" : "highest";
-    let narrative = `**${top.name}** had the ${label} total at **${formatNumber(top.total)}**`;
-    if (second) {
-      narrative += `, followed by **${second.name}** (${formatNumber(second.total)})`;
-    }
-    narrative += ".\n\n";
-    narrative += result.map((r) => `• **${r.name}**: ${formatNumber(r.total)}`).join("\n");
-    return narrative;
+
+    const finalAnswer = `**${top.name}** had the ${label} total at **${formatNumber(top.total)}**${second ? `, followed by **${second.name}** (${formatNumber(second.total)})` : ""}.`;
+    const allRanked   = result.map((r) => `${r.name}: ${formatNumber(r.total)}`).join(" → ");
+    const keyInsight  = `Full ranking: ${allRanked}`;
+
+    return _wrapStructured(
+      finalAnswer,
+      keyInsight,
+      colsUsed,
+      `Totals are summed across all ${rows} rows in the dataset.`
+    );
   }
 
   /* ── extractThemes: { topKeywords, themeClusters } ── */
   if (result?.topKeywords) {
     const topWords = result.topKeywords.slice(0, 5).map((k) => k.word).join(", ");
     const clusterCount = result.themeClusters?.length ?? 0;
-    return `The top recurring themes are: ${topWords}. These form ${clusterCount} distinct topic cluster${clusterCount !== 1 ? "s" : ""} in the feedback.`;
+    const topCluster = result.themeClusters?.[0];
+
+    return _wrapStructured(
+      `The top recurring themes are: **${topWords}**. These form ${clusterCount} distinct topic cluster${clusterCount !== 1 ? "s" : ""} in the feedback.`,
+      topCluster ? `The dominant cluster is "${topCluster.theme}" with ${topCluster.count} entries mentioning related keywords: ${topCluster.keywords.join(", ")}.` : "Themes extracted from word frequency analysis.",
+      colsUsed,
+      `Analysis across ${rows} feedback entries. Stop words removed before counting.`
+    );
   }
 
   /* ── compare: { groups, comparisons } ── */
   if (result?.groups && result?.comparisons) {
     const groups = result.groups;
-    if (groups.length < 2) return "Comparison requires at least two groups.";
+    if (groups.length < 2) return _wrapStructured(
+      "Comparison requires at least two groups.",
+      "Not enough groups found in the data to compare.",
+      colsUsed, "None."
+    );
 
     const metric = Object.keys(groups[0]).find((k) => k !== "group" && typeof groups[0][k] === "object");
     const g1 = groups[0];
@@ -745,14 +1050,29 @@ export function fallbackNarrative(analysisResults, question) {
       const leader = g1Total > g2Total ? g1.group : g2.group;
       const follower = g1Total > g2Total ? g2.group : g1.group;
       const leaderVal = Math.max(g1Total, g2Total);
-      const diff = topCmp.diffPct !== null ? ` (${topCmp.diffPct > 0 ? "+" : ""}${formatPercent(topCmp.diffPct)})` : "";
-      return `${leader} leads with ${formatNumber(leaderVal)} compared to ${follower}${diff}. The largest gap is in ${topCmp.metricCol}.`;
+      const diff = topCmp.diffPct !== null ? ` (${topCmp.diffPct > 0 ? "+" : ""}${formatPercent(topCmp.diffPct)} difference)` : "";
+
+      return _wrapStructured(
+        `**${leader}** leads with **${formatNumber(leaderVal)}** compared to **${follower}**${diff}.`,
+        `The largest performance gap is in **${topCmp.metricCol}**. This metric drives the overall difference between the two groups.`,
+        colsUsed,
+        `Comparison across ${rows} rows.`
+      );
     }
-    return `Compared ${groups.map((g) => g.group).join(", ")} across ${(metadata?.columnsUsed ?? []).join(", ")}.`;
+    return _wrapStructured(
+      `Compared ${groups.map((g) => g.group).join(", ")} across ${colsUsed}.`,
+      "No dominant gap detected between groups.",
+      colsUsed, "None."
+    );
   }
 
   if (!Array.isArray(result) || result.length === 0) {
-    return "The analysis returned no results.";
+    return _wrapStructured(
+      "The analysis returned no results.",
+      "No matching rows or values were found for this query.",
+      colsUsed,
+      "Try broadening your question or checking if the data contains the values you expect."
+    );
   }
 
   const first = result[0] ?? {};
@@ -761,31 +1081,48 @@ export function fallbackNarrative(analysisResults, question) {
   /* ── searchText: rows with _highlighted ── */
   if ("_highlighted" in first) {
     const terms = first._matchedTerms?.join(", ") ?? "";
-    const excerpts = result.slice(0, 2).map((r) => r._highlighted).join(" | ");
-    return `Found ${result.length} matching entr${result.length === 1 ? "y" : "ies"} for "${terms}". ${excerpts}`;
+    const excerpts = result.slice(0, 2).map((r) => `"${r._highlighted}"`).join(", ");
+
+    return _wrapStructured(
+      `Found **${result.length}** matching entr${result.length === 1 ? "y" : "ies"} matching "${terms}".`,
+      `Top matches: ${excerpts}`,
+      colsUsed,
+      `Searched ${rows} entries. Partial word matching used.`
+    );
   }
 
-  /* ── trend: rows with changePct or change field ── */
+  /* ── trend: rows with change + value ── */
   if ("change" in first && "value" in first) {
     const periods = result.filter((r) => r.change !== null);
     if (periods.length === 0) {
-      return `${metadata?.columnsUsed?.[1] ?? "The metric"} trend data shows no period-over-period changes.`;
+      return _wrapStructured(
+        `${metadata?.columnsUsed?.[1] ?? "The metric"} trend data shows no period-over-period changes.`,
+        "All periods have identical or missing comparison values.",
+        colsUsed, "None."
+      );
     }
     const last = periods[periods.length - 1];
     const timeKey = keys.find((k) => typeof last[k] === "string" && !["value", "change", "changePct"].includes(k));
     const metricName = metadata?.columnsUsed?.[1] ?? "the metric";
     const dir = (last.change ?? 0) >= 0 ? "increased" : "decreased";
     const pct = last.changePct !== null ? ` by ${formatPercent(Math.abs(last.changePct))}` : "";
-    const periodLabel = timeKey ? ` in ${last[timeKey]}` : "";
+    const periodLabel = timeKey ? ` in **${last[timeKey]}**` : "";
 
-    let narrative = `${metricName} ${dir}${pct}${periodLabel} (${formatNumber(last.value)}).`;
+    let finalAnswer = `**${metricName}** ${dir}${pct}${periodLabel} to **${formatNumber(last.value)}**.`;
+    let keyInsight  = last.drivers?.length > 0
+      ? (() => {
+          const d = last.drivers[0];
+          const dd = (d.change ?? 0) >= 0 ? "increased" : "decreased";
+          return `The biggest driver was **${d.group}**, which ${dd}${d.changePct !== null ? " by " + formatPercent(Math.abs(d.changePct)) : ""}.`;
+        })()
+      : `The trend covers ${periods.length} time periods. ${dir === "increased" ? "Growth is consistent." : "Decline may warrant attention."}`;
 
-    if (last.drivers?.length > 0) {
-      const topDriver = last.drivers[0];
-      const driverDir = (topDriver.change ?? 0) >= 0 ? "increased" : "decreased";
-      narrative += ` The biggest driver was ${topDriver.group}, which ${driverDir}${topDriver.changePct !== null ? " by " + formatPercent(Math.abs(topDriver.changePct)) : ""}.`;
-    }
-    return narrative;
+    return _wrapStructured(
+      finalAnswer,
+      keyInsight,
+      colsUsed,
+      `"Last period" refers to the most recent entry in the dataset (${timeKey ? last[timeKey] : "latest row"}).`
+    );
   }
 
   /* ── breakdown: rows with share field ── */
@@ -796,11 +1133,17 @@ export function fallbackNarrative(analysisResults, question) {
     const second = result[1];
     const alert = result.find((r) => r.concentrationAlert);
 
-    let narrative = `${top[groupKey]} accounts for ${formatPercent(top.share)} of total ${metricKey} (${formatNumber(top[metricKey])})`;
-    if (second) narrative += `, followed by ${second[groupKey]} at ${formatPercent(second.share)}`;
-    narrative += ".";
-    if (alert) narrative += ` Note: ${alert[groupKey]} alone exceeds 50% — high concentration.`;
-    return narrative;
+    const finalAnswer = `**${top[groupKey]}** accounts for **${formatPercent(top.share)}** of total ${metricKey} (${formatNumber(top[metricKey])})${second ? `, followed by **${second[groupKey]}** at ${formatPercent(second.share)}` : ""}.`;
+    const keyInsight  = alert
+      ? `**${alert[groupKey]}** alone exceeds 50% — indicating high concentration. This means one segment dominates the total.`
+      : `The top ${Math.min(result.length, 3)} contributors account for ${formatPercent(result.slice(0, 3).reduce((s, r) => s + r.share, 0))} of the total.`;
+
+    return _wrapStructured(
+      finalAnswer,
+      keyInsight,
+      colsUsed,
+      `Breakdown across ${rows} rows.`
+    );
   }
 
   /* ── anomaly: rows with _deviationPct ── */
@@ -809,7 +1152,13 @@ export function fallbackNarrative(analysisResults, question) {
     const labelKey = keys.find((k) => typeof first[k] === "string" && !k.startsWith("_")) ?? keys[0];
     const mean = first._mean;
     const top = result[0];
-    return `Found ${result.length} anomal${result.length === 1 ? "y" : "ies"} (column mean: ${formatNumber(mean)}). The most significant: ${top[labelKey] ?? "a data point"} deviates ${formatPercent(top._deviationPct)} from average (value: ${formatNumber(top[metricKey])}).`;
+
+    return _wrapStructured(
+      `Found **${result.length}** anomal${result.length === 1 ? "y" : "ies"} in the data (column average: ${formatNumber(mean)}).`,
+      `The most significant: **${top[labelKey] ?? "a data point"}** deviates **${formatPercent(top._deviationPct)}** from the average (value: ${formatNumber(top[metricKey])}).`,
+      colsUsed,
+      `Anomalies defined as values deviating more than 2 standard deviations from the mean.`
+    );
   }
 
   /* ── summarize: rows with type + mean ── */
@@ -818,14 +1167,30 @@ export function fallbackNarrative(analysisResults, question) {
       if (s.error) return `${s.column}: not found`;
       if (s.type === "categorical") return `${s.column}: most common is "${s.topValue}"`;
       const arrow = s.trendPct !== null ? (s.trendPct >= 0 ? " ↑" : " ↓") : "";
-      return `${s.column}: avg ${formatNumber(s.mean)}${s.latest !== null ? `, latest ${formatNumber(s.latest)}${arrow}` : ""}`;
+      return `**${s.column}**: avg ${formatNumber(s.mean)}${s.latest !== null ? `, latest ${formatNumber(s.latest)}${arrow}` : ""}`;
     });
-    return lines.join(" | ");
+    const topStat = result.find((s) => s.trendPct !== null);
+    const trendNote = topStat
+      ? `**${topStat.column}** shows a ${topStat.trendPct >= 0 ? "positive" : "negative"} trend (${formatPercent(Math.abs(topStat.trendPct))} change period-over-period).`
+      : `${result.length} columns summarised.`;
+
+    return _wrapStructured(
+      lines.join("\n"),
+      trendNote,
+      colsUsed,
+      `Summary across ${rows} rows. Latest vs previous period comparison used where a date column exists.`
+    );
   }
 
   /* ── correlation: rows with coefficient ── */
   if ("coefficient" in first) {
-    return `${first.col1} and ${first.col2} have a ${first.interpretation} (r = ${first.coefficient}).`;
+    const strength = Math.abs(first.coefficient) > 0.7 ? "strong" : Math.abs(first.coefficient) > 0.4 ? "moderate" : "weak";
+    return _wrapStructured(
+      `**${first.col1}** and **${first.col2}** have a **${first.interpretation}** (r = ${first.coefficient}).`,
+      `A ${strength} correlation means ${Math.abs(first.coefficient) > 0.5 ? "these two metrics tend to move together" : "the relationship between these metrics is limited"}.`,
+      colsUsed,
+      `Correlation computed across ${rows} rows. Correlation does not imply causation.`
+    );
   }
 
   /* ── computeMetric / topN / aggregate / generic ranked list ── */
@@ -836,18 +1201,34 @@ export function fallbackNarrative(analysisResults, question) {
     const mid = result[1];
     const last = result[result.length - 1];
 
-    const topLabel = top[labelKey] !== undefined ? String(top[labelKey]) : "Top entry";
-    const midLabel = mid?.[labelKey] !== undefined ? String(mid[labelKey]) : null;
+    const topLabel  = top[labelKey]  !== undefined ? String(top[labelKey])  : "Top entry";
+    const midLabel  = mid?.[labelKey] !== undefined ? String(mid[labelKey])  : null;
     const lastLabel = last[labelKey] !== undefined ? String(last[labelKey]) : null;
 
-    let narrative = `${topLabel} leads with ${formatNumber(top[metricKey])}`;
-    if (midLabel) narrative += `, followed by ${midLabel} (${formatNumber(mid[metricKey])})`;
+    let finalAnswer = `**${topLabel}** leads with **${formatNumber(top[metricKey])}**`;
+    if (midLabel) finalAnswer += `, followed by **${midLabel}** (${formatNumber(mid[metricKey])})`;
     if (result.length > 2 && lastLabel && lastLabel !== topLabel) {
-      narrative += `. ${lastLabel} is at the bottom with ${formatNumber(last[metricKey])}`;
+      finalAnswer += `. **${lastLabel}** is at the bottom with ${formatNumber(last[metricKey])}`;
     }
-    narrative += ".";
-    return narrative;
+    finalAnswer += ".";
+
+    const gap = top[metricKey] && last[metricKey] && last[metricKey] !== 0
+      ? ` The gap between top and bottom is ${formatNumber(top[metricKey] - last[metricKey])}.`
+      : "";
+    const keyInsight = `${topLabel} is the top performer across ${result.length} entries.${gap}`;
+
+    return _wrapStructured(
+      finalAnswer,
+      keyInsight,
+      colsUsed,
+      `Ranked across ${rows} rows.`
+    );
   }
 
-  return method ? `Analysis complete — ${method.toLowerCase()}.` : "Analysis complete.";
+  return _wrapStructured(
+    method ? `Analysis complete — ${method.toLowerCase()}.` : "Analysis complete.",
+    "No notable patterns detected.",
+    colsUsed, "None."
+  );
 }
+
