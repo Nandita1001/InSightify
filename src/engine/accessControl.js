@@ -1,61 +1,84 @@
 /**
  * accessControl.js — Role-Based Column-Level Access Control
  *
- * Responsibilities:
- *  1. Define role permissions with restricted column lists.
- *  2. Fast checkAccess(role, columns) before every query.
- *  3. Manage in-memory access request workflow (create / approve / deny).
+ * Restrictions are based on the ACTUAL columns present in the 4 company datasets:
  *
- * Design principles:
- *  - All column matching is case-insensitive.
- *  - Owner bypasses all restrictions.
- *  - Module is stateful: requests persist in memory until page reload or resetRequests().
+ *  Sales Performance:   month, region, product, channel, revenue, units, cost, returns, ad_spend
+ *  Customer Behavior:   week, signups, churn, active_users, avg_handle_time, nps, tickets, resolution_rate, channel
+ *  Financial Reports:   department, category, Q1, Q2, Q3, Q4, headcount
+ *  Customer Feedback:   date, region, text
+ *
+ * Role philosophy:
+ *  - Owner       → sees everything (no restrictions)
+ *  - Finance Team → owns financials; blocked from raw text/PII, customer-support ops metrics
+ *  - Marketing   → owns campaigns/acquisition; blocked from cost/budget internals, ops metrics
+ *  - HR Team     → owns people data; blocked from customer metrics and financial detail
  */
 
 /* ═══════════════════════════════════════════════════════════
    §1  ROLE PERMISSION DEFINITIONS
+   (based on actual dataset columns only)
 ═══════════════════════════════════════════════════════════ */
 
 const ROLE_PERMISSIONS = {
   Owner: {
-    restricted: [],   // Owner sees everything
+    restricted: [],
     canApprove: true,
   },
+
+  /* Finance Team — can see revenue, cost, ad_spend, Q1-Q4, headcount.
+     Blocked from: customer support ops (avg_handle_time, tickets, resolution_rate, nps)
+                   and raw qualitative text (PII / GDPR risk). */
   "Finance Team": {
     restricted: [
-      { col: "Employee Salaries",   reason: "Sensitive HR data" },
-      { col: "Headcount",           reason: "Sensitive HR data" },
-      { col: "Customer Credit Cards", reason: "PII/PCI compliance" },
-      { col: "NPS_Score",           reason: "Customer sentiment restricted" },
-      { col: "text",                reason: "Raw feedback restricted" },
+      { col: "text",            reason: "Raw customer feedback — PII / GDPR restricted" },
+      { col: "nps",             reason: "Customer experience metric — owned by Customer Success" },
+      { col: "avg_handle_time", reason: "Support operations metric — not financial data" },
+      { col: "tickets",         reason: "Support operations metric — not financial data" },
+      { col: "resolution_rate", reason: "Support operations metric — not financial data" },
     ],
     canApprove: false,
   },
+
+  /* Marketing Team — can see revenue, signups, churn, nps, channel, product, region.
+     Blocked from: internal cost breakdown, quarterly budget detail, headcount (confidential),
+                   support ops metrics (not marketing's purview). */
   "Marketing Team": {
     restricted: [
-      { col: "Employee Salaries", reason: "Sensitive HR data" },
-      { col: "Headcount",         reason: "Sensitive HR data" },
-      { col: "Cost",              reason: "Confidential financial data" },
-      { col: "Q1",                reason: "Quarterly financials restricted" },
-      { col: "Q2",                reason: "Quarterly financials restricted" },
-      { col: "Q3",                reason: "Quarterly financials restricted" },
-      { col: "Q4",                reason: "Quarterly financials restricted" },
+      { col: "cost",            reason: "Internal cost data — Finance confidential" },
+      { col: "ad_spend",        reason: "Budget allocation — Finance confidential" },
+      { col: "Q1",              reason: "Quarterly budget breakdown — Finance confidential" },
+      { col: "Q2",              reason: "Quarterly budget breakdown — Finance confidential" },
+      { col: "Q3",              reason: "Quarterly budget breakdown — Finance confidential" },
+      { col: "Q4",              reason: "Quarterly budget breakdown — Finance confidential" },
+      { col: "headcount",       reason: "Headcount data — HR confidential" },
+      { col: "avg_handle_time", reason: "Support operations metric — not marketing data" },
+      { col: "resolution_rate", reason: "Support operations metric — not marketing data" },
     ],
     canApprove: false,
   },
+
+  /* HR Team — can see headcount, department, signups, churn, active_users.
+     Blocked from: all financial figures (revenue, cost, ad_spend, Q1-Q4),
+                   customer experience scores, and raw feedback text (PII). */
   "HR Team": {
     restricted: [
-      { col: "Revenue",               reason: "Financial data restricted" },
-      { col: "Ad_Spend",              reason: "Marketing budget restricted" },
-      { col: "Cost",                  reason: "Confidential financial data" },
-      { col: "Customer Credit Cards", reason: "PII/PCI compliance" },
+      { col: "revenue",   reason: "Financial data — Finance Team only" },
+      { col: "cost",      reason: "Financial data — Finance Team only" },
+      { col: "ad_spend",  reason: "Marketing budget — Finance/Marketing only" },
+      { col: "Q1",        reason: "Quarterly financials — Finance Team only" },
+      { col: "Q2",        reason: "Quarterly financials — Finance Team only" },
+      { col: "Q3",        reason: "Quarterly financials — Finance Team only" },
+      { col: "Q4",        reason: "Quarterly financials — Finance Team only" },
+      { col: "nps",       reason: "Customer experience KPI — Customer Success only" },
+      { col: "text",      reason: "Raw customer feedback — PII / GDPR restricted" },
+      { col: "returns",   reason: "Sales returns detail — Sales/Finance only" },
     ],
     canApprove: false,
   },
 };
 
-/* ─── pre-compute lowercase lookup map per role for O(1) checks ─── */
-// Maps: role → Map<lowercaseCol, reason>
+/* ─── Mutable restriction index per role: role → Map<lowercaseCol, reason> ─── */
 const _restrictionIndex = {};
 for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
   _restrictionIndex[role] = new Map(
@@ -67,38 +90,33 @@ for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
    §2  IN-MEMORY ACCESS REQUESTS STORE
 ═══════════════════════════════════════════════════════════ */
 
-/**
- * Pre-populate with the same mock requests shown in the UI.
- * Status: "pending" | "approved" | "denied"
- */
 let _requests = [
   {
     id: 1001,
     from: "Marketing Team",
-    columns: ["Customer Email", "Purchase History"],
-    reason: "Needed for targeted campaign segmentation",
+    columns: ["cost", "ad_spend"],
+    reason: "Need cost data to calculate ROI for campaigns",
     status: "pending",
-    timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000), // 2 hours ago
+    timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000),
   },
   {
     id: 1002,
-    from: "Finance Team",
-    columns: ["Revenue by Region", "Profit Margins"],
-    reason: "Required for quarterly P&L analysis",
+    from: "HR Team",
+    columns: ["revenue"],
+    reason: "Needed for executive compensation benchmarking",
     status: "pending",
-    timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000), // 5 hours ago
+    timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000),
   },
   {
     id: 1003,
-    from: "HR Team",
-    columns: ["Headcount Budget"],
-    reason: "Annual headcount planning review",
+    from: "Finance Team",
+    columns: ["nps"],
+    reason: "Required for quarterly business review dashboard",
     status: "approved",
-    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000), // 1 day ago
+    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000),
   },
 ];
 
-/** Auto-increment ID counter, starts after pre-populated seeds. */
 let _nextId = 2000;
 
 /* ═══════════════════════════════════════════════════════════
@@ -107,14 +125,9 @@ let _nextId = 2000;
 
 /**
  * Check whether a role can access all of the required columns.
- * Called before EVERY query — must be fast (O(n) on requiredColumns).
- *
- * @param {string}   role            — One of the defined role names
- * @param {string[]} requiredColumns — Column names that will be accessed
- * @returns {{ allowed: boolean, blockedColumns: { col: string, reason: string }[] }}
+ * Respects dynamically granted access from approved requests.
  */
 export function checkAccess(role, requiredColumns) {
-  // Owner bypasses all restrictions
   if (role === "Owner" || !ROLE_PERMISSIONS[role]) {
     return { allowed: true, blockedColumns: [] };
   }
@@ -136,31 +149,25 @@ export function checkAccess(role, requiredColumns) {
 }
 
 /**
- * Return the restricted column list for a role.
- * Returns an empty array for Owner or unknown roles.
- *
- * @param {string} role
- * @returns {{ col: string, reason: string }[]}
+ * Return the CURRENT restricted column list for a role.
+ * Reads from the live _restrictionIndex so approved grants are reflected immediately.
  */
 export function getRestrictions(role) {
-  return ROLE_PERMISSIONS[role]?.restricted ?? [];
+  if (role === "Owner" || !_restrictionIndex[role]) return [];
+  return Array.from(_restrictionIndex[role].entries()).map(([col, reason]) => ({
+    col: ROLE_PERMISSIONS[role]?.restricted.find(
+      (r) => r.col.toLowerCase() === col
+    )?.col ?? col,
+    reason,
+  }));
 }
 
-/**
- * Return all defined role names.
- * @returns {string[]}
- */
+/** Return all defined role names. */
 export function getRoles() {
   return Object.keys(ROLE_PERMISSIONS);
 }
 
-/**
- * Return whether a role can approve access requests.
- * Only Owner returns true by default.
- *
- * @param {string} role
- * @returns {boolean}
- */
+/** Return whether a role can approve access requests. */
 export function canApprove(role) {
   return ROLE_PERMISSIONS[role]?.canApprove ?? false;
 }
@@ -170,14 +177,23 @@ export function canApprove(role) {
 ═══════════════════════════════════════════════════════════ */
 
 /**
- * Create and store a new access request.
- *
- * @param {string}   fromRole  — Role making the request
- * @param {string[]} columns   — Columns being requested
- * @param {string}   [reason]  — Optional plain-text justification
- * @returns {{ id, from, columns, reason, status, timestamp }}
+ * Create a new access request.
+ * Deduplicates: returns existing pending request if same role+columns already pending.
  */
 export function createAccessRequest(fromRole, columns, reason = "") {
+  const normalizedCols = [].concat(columns).map((c) => c.toLowerCase()).sort();
+
+  const existing = _requests.find((r) => {
+    if (r.from !== fromRole || r.status !== "pending") return false;
+    const existing = r.columns.map((c) => c.toLowerCase()).sort();
+    return (
+      existing.length === normalizedCols.length &&
+      existing.every((c, i) => c === normalizedCols[i])
+    );
+  });
+
+  if (existing) return { ...existing };
+
   const request = {
     id: _nextId++,
     from: fromRole,
@@ -187,43 +203,52 @@ export function createAccessRequest(fromRole, columns, reason = "") {
     timestamp: new Date(),
   };
   _requests.push(request);
-  return { ...request }; // return a copy
+  return { ...request };
 }
 
-/**
- * Return all access requests (copy of the array).
- * @returns {object[]}
- */
+/** Return all access requests (shallow copies), newest first. */
 export function getAccessRequests() {
-  return _requests.map((r) => ({ ...r }));
+  return [..._requests]
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+    .map((r) => ({ ...r }));
 }
 
-/**
- * Return only pending access requests.
- * @returns {object[]}
- */
+/** Return only pending access requests. */
 export function getPendingRequests() {
   return _requests.filter((r) => r.status === "pending").map((r) => ({ ...r }));
 }
 
 /**
  * Approve an access request by id.
- * @param {number} requestId
- * @returns {{ ...request } | null}  null if not found
+ * Dynamically removes approved columns from the role's restriction index
+ * and from ROLE_PERMISSIONS.restricted — so checkAccess() and getRestrictions()
+ * immediately reflect the grant on the next call.
  */
 export function approveRequest(requestId) {
   const req = _requests.find((r) => r.id === requestId);
   if (!req) return null;
+
   req.status = "approved";
   req.resolvedAt = new Date();
+
+  const roleIndex = _restrictionIndex[req.from];
+  if (roleIndex) {
+    for (const col of req.columns) {
+      roleIndex.delete(col.toLowerCase());
+    }
+    const perms = ROLE_PERMISSIONS[req.from];
+    if (perms) {
+      const lowerApproved = req.columns.map((c) => c.toLowerCase());
+      perms.restricted = perms.restricted.filter(
+        (r) => !lowerApproved.includes(r.col.toLowerCase())
+      );
+    }
+  }
+
   return { ...req };
 }
 
-/**
- * Deny an access request by id.
- * @param {number} requestId
- * @returns {{ ...request } | null}  null if not found
- */
+/** Deny an access request by id. */
 export function denyRequest(requestId) {
   const req = _requests.find((r) => r.id === requestId);
   if (!req) return null;
@@ -232,62 +257,51 @@ export function denyRequest(requestId) {
   return { ...req };
 }
 
-/**
- * Reset all requests back to the pre-populated seed data.
- * Useful for testing and dev resets.
- */
+/** Reset all requests and restriction indices to boot state. */
 export function resetRequests() {
   _requests = [
     {
       id: 1001,
       from: "Marketing Team",
-      columns: ["Customer Email", "Purchase History"],
-      reason: "Needed for targeted campaign segmentation",
+      columns: ["cost", "ad_spend"],
+      reason: "Need cost data to calculate ROI for campaigns",
       status: "pending",
       timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000),
     },
     {
       id: 1002,
-      from: "Finance Team",
-      columns: ["Revenue by Region", "Profit Margins"],
-      reason: "Required for quarterly P&L analysis",
+      from: "HR Team",
+      columns: ["revenue"],
+      reason: "Needed for executive compensation benchmarking",
       status: "pending",
       timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000),
     },
     {
       id: 1003,
-      from: "HR Team",
-      columns: ["Headcount Budget"],
-      reason: "Annual headcount planning review",
+      from: "Finance Team",
+      columns: ["nps"],
+      reason: "Required for quarterly business review dashboard",
       status: "approved",
       timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000),
     },
   ];
   _nextId = 2000;
+
+  for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
+    _restrictionIndex[role] = new Map(
+      config.restricted.map(({ col, reason }) => [col.toLowerCase(), reason])
+    );
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════
-   §5  INTROSPECTION HELPERS  (useful for UI and tests)
+   §5  INTROSPECTION HELPERS
 ═══════════════════════════════════════════════════════════ */
 
-/**
- * Return the full ROLE_PERMISSIONS definition (read-only copy).
- * Useful for rendering restriction lists in the UI.
- * @returns {object}
- */
 export function getAllPermissions() {
   return JSON.parse(JSON.stringify(ROLE_PERMISSIONS));
 }
 
-/**
- * Given a role and a dataset's column list, return two arrays:
- *   allowed:  columns accessible to the role
- *   blocked:  columns blocked with reasons
- *
- * @param {string}   role
- * @param {string[]} datasetColumns
- * @returns {{ allowed: string[], blocked: { col: string, reason: string }[] }}
- */
 export function partitionColumns(role, datasetColumns) {
   if (role === "Owner" || !ROLE_PERMISSIONS[role]) {
     return { allowed: datasetColumns, blocked: [] };

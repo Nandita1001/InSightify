@@ -356,12 +356,41 @@ function _scoreDataset(question, dataset) {
 function _pickDataset(question, registryMetadata, intent) {
   if (!registryMetadata || registryMetadata.length === 0) return null;
 
-  // Force feedback dataset for text/sentiment intents
+  const lower = question.toLowerCase();
+
+  // ── Force feedback dataset for text/sentiment intents ──
   if (intent === "text_search" || intent === "sentiment") {
     const fb = registryMetadata.find((d) => d.name.toLowerCase().includes("feedback"));
     if (fb) return fb;
   }
 
+  // ── Domain keyword shortcuts (real dataset columns) ──
+  // Customer Behavior keywords
+  const customerKw = ["churn", "signups", "nps", "active_users", "active users", "tickets",
+                      "resolution_rate", "avg_handle_time", "handle time", "week"];
+  // Financial Reports (Costs) keywords
+  const costsKw    = ["department", "headcount", "category", "q1", "q2", "q3", "q4", "quarterly", "quarter"];
+  // Customer Feedback keywords
+  const feedbackKw = ["feedback", "complaint", "review", "text", "qualitative"];
+
+  const matchCustomer = customerKw.some((k) => lower.includes(k));
+  const matchCosts    = costsKw.some((k) => lower.includes(k));
+  const matchFeedback = feedbackKw.some((k) => lower.includes(k));
+
+  if (matchFeedback && !matchCustomer && !matchCosts) {
+    const ds = registryMetadata.find((d) => d.name.toLowerCase().includes("feedback"));
+    if (ds) return ds;
+  }
+  if (matchCustomer && !matchCosts) {
+    const ds = registryMetadata.find((d) => d.name.toLowerCase().includes("customer") && !d.name.toLowerCase().includes("feedback"));
+    if (ds) return ds;
+  }
+  if (matchCosts && !matchCustomer) {
+    const ds = registryMetadata.find((d) => d.name.toLowerCase().includes("financial"));
+    if (ds) return ds;
+  }
+
+  // ── Column-name scoring fallback ──
   const scored = registryMetadata
     .map((ds) => ({ ds, score: _scoreDataset(question, ds) }))
     .sort((a, b) => b.score - a.score);
@@ -473,6 +502,14 @@ function _buildOperations(intent, question, dataset) {
       if (isTextOnly) {
         return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text", groupCol: primaryGroup } }];
       }
+      // Detect column-series comparison: e.g. "compare Q1, Q2, Q3, Q4"
+      {
+        const quarterCols = numericCols.filter((c) => /^Q[1-4]$/i.test(c));
+        const asksAboutQuarter = /\bquarter\b|\bQ[1-4]\b/i.test(question);
+        if (quarterCols.length > 1 && asksAboutQuarter) {
+          return [{ function: "rankColumns", params: { columns: quarterCols, direction: "top" } }];
+        }
+      }
       return [{ function: "compare", params: { groupCol: primaryGroup, metricCols: numericCols.slice(0, 3) } }];
 
     case "trend": {
@@ -496,6 +533,13 @@ function _buildOperations(intent, question, dataset) {
       if (isTextOnly) {
         // Rank time/group periods by sentiment
         return [{ function: "sentimentScan", params: { textCol: textCols[0] ?? "text", groupCol: primaryGroup ?? timeCol } }];
+      }
+      // Detect "which quarter/Q1-Q4" style: comparing COLUMNS rather than ROWS
+      const quarterCols = numericCols.filter((c) => /^Q[1-4]$/i.test(c));
+      const asksAboutQuarter = /\bquarter\b|\bQ[1-4]\b/i.test(question);
+      if (quarterCols.length > 1 && asksAboutQuarter) {
+        const isBottom = /\bworst\b|\blowest\b|\bbottom\b|\bleast\b/i.test(question);
+        return [{ function: "rankColumns", params: { columns: quarterCols, direction: isBottom ? "bottom" : "top" } }];
       }
       const isBottom = /\bbottom\b|\blowest\b|\bworst\b|\bleast\b/i.test(question);
       return [{
@@ -661,6 +705,21 @@ export function fallbackNarrative(analysisResults, question) {
     }
 
     return `Sentiment across ${total} feedback entries is ${tone}: ${posPct}% positive, ${negPct}% negative, and ${neuPct}% neutral.`;
+  }
+
+  /* ── rankColumns: [{ name, total, rank }] ── */
+  if (Array.isArray(result) && result.length > 0 && result[0]?.rank !== undefined && result[0]?.total !== undefined && result[0]?.name !== undefined) {
+    const top    = result[0];
+    const second = result[1];
+    const isWorstQ = /worst|lowest|bottom|least/i.test(question);
+    const label  = isWorstQ ? "lowest" : "highest";
+    let narrative = `**${top.name}** had the ${label} total at **${formatNumber(top.total)}**`;
+    if (second) {
+      narrative += `, followed by **${second.name}** (${formatNumber(second.total)})`;
+    }
+    narrative += ".\n\n";
+    narrative += result.map((r) => `• **${r.name}**: ${formatNumber(r.total)}`).join("\n");
+    return narrative;
   }
 
   /* ── extractThemes: { topKeywords, themeClusters } ── */

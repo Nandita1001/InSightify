@@ -10,7 +10,7 @@ function AppContent() {
   const { notification } = useApp();
 
   return (
-    <div className="min-h-screen flex flex-col" style={{ background: "#f8f9fb", fontFamily: "'Plus Jakarta Sans', sans-serif", color: "#1a1a2e" }}>
+    <div className="h-screen flex flex-col overflow-hidden" style={{ background: "#f8f9fb", fontFamily: "'Plus Jakarta Sans', sans-serif", color: "#1a1a2e" }}>
       <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 
       {/* NOTIFICATION TOAST */}

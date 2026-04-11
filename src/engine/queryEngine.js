@@ -27,6 +27,7 @@ import {
   computeMetric,
   joinDatasets,
   summarize,
+  rankColumns,
   searchText,
   extractThemes,
   sentimentScan,
@@ -234,6 +235,42 @@ export async function processQuery(
     let analysisPlan;
     try {
       analysisPlan = await parseQuery(question, availableDatasets, conversationContext);
+
+      // ── Validate: check that operation column params actually exist in the dataset ──
+      // If Groq hallucinated column names, fall back to the local parser.
+      if (analysisPlan) {
+        const targetSummary = availableDatasets.find((ds) =>
+          analysisPlan.datasets?.some((n) =>
+            ds.name.toLowerCase().includes(n.toLowerCase()) ||
+            n.toLowerCase().includes(ds.name.toLowerCase().split(" ")[0])
+          )
+        ) ?? availableDatasets[0];
+
+        const knownCols = new Set(
+          (targetSummary?.columns ?? []).map((c) => c.name.toLowerCase())
+        );
+
+        // Collect every single-string column param from the plan
+        const planCols = [];
+        for (const op of analysisPlan.operations ?? []) {
+          const p = op.params ?? {};
+          for (const key of ["metricCol", "groupCol", "timeCol", "column", "col1", "col2", "textCol"]) {
+            if (typeof p[key] === "string" && p[key]) planCols.push(p[key]);
+          }
+          for (const arr of [p.metricCols, p.columns].filter(Array.isArray)) {
+            for (const c of arr) if (typeof c === "string" && c) planCols.push(c);
+          }
+        }
+
+        // If any named column is unknown to the dataset, local parser is more reliable
+        const hasInvalidCol = planCols.some(
+          (c) => knownCols.size > 0 && !knownCols.has(c.toLowerCase())
+        );
+        if (hasInvalidCol) {
+          console.warn("[queryEngine] Groq plan had invalid columns, falling back to local parser.", planCols);
+          analysisPlan = fallbackParseQuery(question, availableDatasets);
+        }
+      }
     } catch {
       analysisPlan = fallbackParseQuery(question, availableDatasets);
     }
@@ -351,7 +388,7 @@ export async function processQuery(
     const OPS = {
       aggregate, filter, sort, topN, trend, compare, breakdown,
       anomaly, correlation, computeMetric, joinDatasets, summarize,
-      searchText, extractThemes, sentimentScan
+      rankColumns, searchText, extractThemes, sentimentScan
     };
 
     const executionLog = [];
@@ -411,6 +448,9 @@ export async function processQuery(
           }
           case "summarize":
             opResult = fn(data, p.columns);
+            break;
+          case "rankColumns":
+            opResult = fn(data, p.columns, p.direction ?? "top");
             break;
           case "searchText":
             opResult = fn(data, p.textCol, p.query);
@@ -500,34 +540,84 @@ export async function processQuery(
    EXTRA EXPORTS
 ═══════════════════════════════════════════════════════════ */
 
-export function getSuggestedQuestions(activeTab, uploadedDatasetId) {
+export function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owner") {
   if (activeTab === "company") {
-    return [
+    // Role-specific suggestions — avoid suggesting columns that are restricted
+    const isMarketing = role === "Marketing Team";
+    const isHR        = role === "HR Team";
+    const isFinance   = role === "Finance Team";
+
+    const salesQs = [
       "What is the revenue by region?",
-      "Show top 5 products by revenue",
-      "How is churn trending over time?",
-      "Compare Q1 and Q2 revenue"
+      "Show top 3 products by revenue",
+      "How did revenue trend month over month?",
+      "Which channel generates the most revenue?",
+      "What is the breakdown of units sold by product?",
     ];
-  } else if (activeTab === "upload" && uploadedDatasetId) {
+
+    const customerQs = [
+      "How is churn trending by week?",
+      "Show signups vs churn over time",
+      "Which week had the highest active users?",
+      isFinance ? null : "How did NPS change over time?",
+      "Which channel has the most signups?",
+    ].filter(Boolean);
+
+    const costQs = isHR
+      ? [
+          "Which department has the highest headcount?",
+          "Show headcount breakdown by department",
+        ]
+      : isMarketing
+      ? [
+          "Which department has the highest headcount?",
+        ]
+      : [
+          "Which department had the highest spend in Q1?",
+          "Compare Q1, Q2, Q3, Q4 spending across departments",
+          "Which department has the highest headcount?",
+          "Show the spending breakdown by category",
+        ];
+
+    const feedbackQs = (isFinance || isHR)
+      ? []  // Finance and HR are blocked from raw text
+      : [
+          "Which month had the worst customer feedback?",
+          "What are the main complaints in customer feedback?",
+        ];
+
+    return [...salesQs.slice(0, 2), ...customerQs.slice(0, 1), ...costQs.slice(0, 1), ...feedbackQs.slice(0, 1)];
+  }
+
+  if (activeTab === "upload" && uploadedDatasetId) {
     const ds = getDatasetSummary(uploadedDatasetId);
     if (!ds) return [];
-    
-    // Dynamic based on columns
-    const numericCols = ds.columns.filter(c => c.type === "numeric");
-    const catCols = ds.columns.filter(c => c.type === "categorical");
-    
+
+    const numericCols = ds.columns.filter((c) => c.type === "numeric");
+    const catCols     = ds.columns.filter((c) => c.type === "categorical");
+    const textCols    = ds.columns.filter((c) => c.type === "text");
+    const dateCols    = ds.columns.filter((c) => c.type === "date");
+
     const suggested = [];
     if (numericCols.length > 0 && catCols.length > 0) {
-      suggested.push(`Show total ${numericCols[0].name.toLowerCase()} by ${catCols[0].name.toLowerCase()}`);
-      if (catCols.length > 1) {
-         suggested.push(`Breakdown ${numericCols[0].name.toLowerCase()} by ${catCols[1].name.toLowerCase()}`);
-      }
+      suggested.push(`What is the total ${numericCols[0].name} by ${catCols[0].name}?`);
+      suggested.push(`Show top 5 ${catCols[0].name} by ${numericCols[0].name}`);
+    }
+    if (dateCols.length > 0 && numericCols.length > 0) {
+      suggested.push(`How did ${numericCols[0].name} trend over time?`);
+    }
+    if (numericCols.length > 1) {
+      suggested.push(`Compare ${numericCols[0].name} and ${numericCols[1].name}`);
+    }
+    if (textCols.length > 0) {
+      suggested.push(`What are the main themes in ${textCols[0].name}?`);
     }
     if (numericCols.length > 0) {
-       suggested.push(`What is the average ${numericCols[0].name.toLowerCase()}?`);
+      suggested.push(`What is the average ${numericCols[0].name}?`);
     }
-    return suggested;
+    return suggested.slice(0, 5);
   }
+
   return [];
 }
 

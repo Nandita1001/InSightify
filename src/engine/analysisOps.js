@@ -801,6 +801,61 @@ export function joinDatasets(data1, data2, joinCol) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   §9b  RANK COLUMNS  (columns-as-series comparison)
+═══════════════════════════════════════════════════════════ */
+
+/**
+ * Sum a list of named columns across all rows and return them ranked.
+ * Purpose: answers "which quarter/metric was highest/lowest" when the values
+ * to compare are spread across COLUMNS rather than ROWS.
+ *
+ * Example: Q1=94000, Q2=123700, Q3=102300, Q4=105500 → sorted desc
+ *
+ * @param {object[]}  data       — row array
+ * @param {string[]}  columns    — column names to compare (e.g. ["Q1","Q2","Q3","Q4"])
+ * @param {"top"|"bottom"} direction — "top" = highest first (default)
+ * @returns standard envelope with result = [{ name, total, rank }]
+ */
+export function rankColumns(data, columns, direction = "top") {
+  if (!data || data.length === 0) return errResult("No data for column ranking.");
+  if (!columns || columns.length === 0) return errResult("No columns specified for ranking.");
+
+  const resolved = columns
+    .map((c) => ({ orig: c, key: resolveCol(data, c) }))
+    .filter((c) => c.key !== null);
+
+  if (resolved.length === 0) {
+    return errResult(`None of the columns [${columns.join(", ")}] were found in the dataset.`);
+  }
+
+  // Sum each column across all rows
+  const totals = resolved.map(({ orig, key }) => {
+    const total = data.reduce((sum, row) => {
+      const v = toNum(row[key]);
+      return sum + (isNaN(v) ? 0 : v);
+    }, 0);
+    return { name: orig, total: +total.toFixed(2) };
+  });
+
+  // Sort
+  const sorted = [...totals].sort((a, b) =>
+    direction === "top" ? b.total - a.total : a.total - b.total
+  );
+
+  const result = sorted.map((item, i) => ({ ...item, rank: i + 1 }));
+
+  return {
+    result,
+    metadata: meta(
+      resolved.map((c) => c.key),
+      data.length,
+      `Ranked ${resolved.length} columns by total (${direction}): ${sorted.map((c) => `${c.name}=${c.total}`).join(", ")}`,
+      null
+    ),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
    §10  SUMMARIZE
 ═══════════════════════════════════════════════════════════ */
 

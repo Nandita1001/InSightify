@@ -1,45 +1,17 @@
-import { Send, Paperclip, Loader2 } from "lucide-react";
-import { useRef } from "react";
+import { Send, Loader2 } from "lucide-react";
 import { useApp } from "../context/AppContext";
 
 export default function ChatInput() {
-  const { input, setInput, handleSend, handleFileUpload, isLoading, activeTab } = useApp();
-  const localFileRef = useRef(null);
-
-  const onFileChange = (e) => {
-    const file = e.target.files?.[0];
-    if (file) handleFileUpload(file);
-    e.target.value = "";
-  };
+  const { input, setInput, handleSend, isLoading } = useApp();
 
   const canSend = input.trim().length > 0 && !isLoading;
 
   return (
     <div className="px-8 pb-5 pt-2">
-      {/* Hidden file input for Paperclip */}
-      <input
-        ref={localFileRef}
-        type="file"
-        accept=".csv,.xlsx,.xls,.tsv"
-        className="hidden"
-        onChange={onFileChange}
-      />
-
       <div
         className="max-w-3xl mx-auto flex items-center gap-3 px-4 py-3 rounded-2xl border shadow-sm"
         style={{ background: "#fff", borderColor: "#e8eaed" }}
       >
-        {/* Paperclip — always visible, active on upload tab */}
-        <button
-          type="button"
-          onClick={() => localFileRef.current?.click()}
-          title="Upload a CSV or Excel file"
-          className="flex-shrink-0 transition-opacity hover:opacity-70"
-          style={{ color: activeTab === "upload" ? "#6366f1" : "#c0c0c0" }}
-        >
-          <Paperclip size={18} />
-        </button>
-
         {/* Text input */}
         <input
           value={input}

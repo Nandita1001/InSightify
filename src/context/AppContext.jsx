@@ -49,8 +49,9 @@ export function AppProvider({ children }) {
   /* ── Loading ── */
   const [isLoading, setIsLoading]       = useState(false);
 
-  /* ── Per-role chat storage ── */
-  const [allChats, setAllChats] = useState(() => {
+  /* ── Per-role, per-tab chat storage ── */
+  // chats are stored separately for company tab and upload tab.
+  const [companyChats, setCompanyChats] = useState(() => {
     const initial = {};
     for (const r of getRoles()) {
       initial[r] = {
@@ -61,17 +62,25 @@ export function AppProvider({ children }) {
     return initial;
   });
 
+  // Upload tab gets a single flat chat (no sidebar history needed)
+  const [uploadChat, setUploadChat] = useState({ messages: [] });
+
   /* ── Derived chat values ── */
-  const roleChats      = allChats[role]?.chats ?? [];
-  const activeChatId   = allChats[role]?.activeChatId ?? roleChats[0]?.id;
+  const isUploadTab    = activeTab === "upload";
+
+  // Company-tab derived values
+  const roleChats      = companyChats[role]?.chats ?? [];
+  const activeChatId   = companyChats[role]?.activeChatId ?? roleChats[0]?.id;
   const activeChat     = roleChats.find((c) => c.id === activeChatId) ?? roleChats[0];
-  const currentMessages  = activeChat?.messages ?? [];
-  const displayMessages  = currentMessages;
+
+  // Active messages depend on which tab we're in
+  const currentMessages = isUploadTab ? uploadChat.messages : (activeChat?.messages ?? []);
+  const displayMessages = currentMessages;
 
   /* ── Derived engine values ── */
   const restrictions     = getRestrictions(role);   // from accessControl engine
   const pendingCount     = accessRequests.filter((r) => r.status === "pending").length;
-  const suggestedQuestions = getSuggestedQuestions(activeTab, uploadedDatasetId);
+  const suggestedQuestions = getSuggestedQuestions(activeTab, uploadedDatasetId, role);
   const dataDictionary     = getDataDictionary(activeTab, uploadedDatasetId);
   const registryInfo       = getRegistryInfo();
   const roles              = getRoles();
@@ -109,43 +118,56 @@ export function AppProvider({ children }) {
     setTimeout(() => setNotification(null), 3000);
   };
 
-  /* ── Push a message into the current active chat ── */
+  /* ── Push a message into the current active chat (tab-aware) ── */
   const pushMessage = (msg) => {
-    setAllChats((prev) => {
-      const roleData = { ...prev[role] };
-      roleData.chats = roleData.chats.map((c) => {
-        if (c.id !== activeChatId) return c;
-        const updated = { ...c, messages: [...c.messages, msg] };
-        // Auto-rename "New Chat" on first user message
-        if (c.name === "New Chat" && msg.role === "user") {
-          updated.name =
-            msg.content.length > 30 ? msg.content.slice(0, 30) + "…" : msg.content;
-        }
-        return updated;
+    if (activeTab === "upload") {
+      // Upload tab: single flat chat
+      setUploadChat((prev) => ({ messages: [...prev.messages, msg] }));
+    } else {
+      // Company tab: per-role, per-chat
+      setCompanyChats((prev) => {
+        const roleData = { ...prev[role] };
+        roleData.chats = roleData.chats.map((c) => {
+          if (c.id !== activeChatId) return c;
+          const updated = { ...c, messages: [...c.messages, msg] };
+          if (c.name === "New Chat" && msg.role === "user") {
+            updated.name =
+              msg.content.length > 30 ? msg.content.slice(0, 30) + "…" : msg.content;
+          }
+          return updated;
+        });
+        return { ...prev, [role]: roleData };
       });
-      return { ...prev, [role]: roleData };
-    });
+    }
   };
 
-  /* ── New Chat ── */
+  /* ── New Chat (company tab only) ── */
   const handleNewChat = () => {
-    const newId = Date.now();
-    setAllChats((prev) => {
-      const roleData = { ...prev[role] };
-      roleData.chats = [
-        { id: newId, name: "New Chat", time: "just now", messages: [] },
-        ...roleData.chats,
-      ];
-      roleData.activeChatId = newId;
-      return { ...prev, [role]: roleData };
-    });
+    if (activeTab === "upload") {
+      // In upload tab, "new chat" means clear messages and remove the uploaded file
+      setUploadChat({ messages: [] });
+      if (uploadedDatasetId) removeDataset(uploadedDatasetId);
+      setUploadedFile(null);
+      setUploadedDatasetId(null);
+    } else {
+      const newId = Date.now();
+      setCompanyChats((prev) => {
+        const roleData = { ...prev[role] };
+        roleData.chats = [
+          { id: newId, name: "New Chat", time: "just now", messages: [] },
+          ...roleData.chats,
+        ];
+        roleData.activeChatId = newId;
+        return { ...prev, [role]: roleData };
+      });
+    }
     setInput("");
     setExpandedTrust(null);
   };
 
-  /* ── Switch Chat ── */
+  /* ── Switch Chat (company tab only) ── */
   const switchChat = (chatId) => {
-    setAllChats((prev) => ({
+    setCompanyChats((prev) => ({
       ...prev,
       [role]: { ...prev[role], activeChatId: chatId },
     }));
@@ -159,7 +181,7 @@ export function AppProvider({ children }) {
     } else {
       denyRequest(id);
     }
-    // Sync local state from engine so UI re-renders
+    // Sync access requests AND restrictions from engine (approval mutates both)
     setAccessRequests(getAccessRequests());
     showNotif(approved ? "Access approved successfully" : "Access request denied");
   };
@@ -177,8 +199,9 @@ export function AppProvider({ children }) {
     setInput("");
     setIsLoading(true);
 
-    // Build conversation context snapshot (last 5 messages)
-    const context = (activeChat?.messages ?? []).slice(-5).map((m) => ({
+    // Build conversation context snapshot from the correct chat (last 5 messages)
+    const ctxMessages = isUploadTab ? uploadChat.messages : (activeChat?.messages ?? []);
+    const context = ctxMessages.slice(-5).map((m) => ({
       role: m.role,
       content: m.content ?? "",
     }));
@@ -188,10 +211,6 @@ export function AppProvider({ children }) {
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
       if (result.type === "blocked") {
-        // Also create a real access request in the engine
-        createAccessRequest(role, result.blockedColumns.map((b) => b.col), `Triggered by query: "${text}"`);
-        setAccessRequests(getAccessRequests()); // sync request list
-
         pushMessage({
           role: "assistant",
           blocked: true,
@@ -236,6 +255,9 @@ export function AppProvider({ children }) {
     if (!file) return;
     setIsLoading(true);
 
+    // Reset upload chat so it starts fresh with the new dataset
+    setUploadChat({ messages: [] });
+
     try {
       // Remove old upload from registry
       if (uploadedDatasetId) removeDataset(uploadedDatasetId);
@@ -251,17 +273,22 @@ export function AppProvider({ children }) {
         .join("\n");
       const extra = entry.columns.length > 12 ? `\n• …and ${entry.columns.length - 12} more columns` : "";
 
-      pushMessage({
-        role: "assistant",
-        content: `Successfully loaded **${entry.name}** — ${entry.rowCount.toLocaleString()} rows and ${entry.columns.length} columns detected.\n\n${colLines}${extra}\n\nAsk me anything about your data!`,
-        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      // Push welcome message directly into upload chat
+      setUploadChat({
+        messages: [{
+          role: "assistant",
+          content: `Successfully loaded **${entry.name}** — ${entry.rowCount.toLocaleString()} rows and ${entry.columns.length} columns detected.\n\n${colLines}${extra}\n\nAsk me anything about your data!`,
+          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        }]
       });
     } catch (err) {
-      pushMessage({
-        role: "assistant",
-        content: "Failed to load the file. Please make sure it's a valid CSV file.",
-        isError: true,
-        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      setUploadChat({
+        messages: [{
+          role: "assistant",
+          content: "Failed to load the file. Please make sure it's a valid CSV file.",
+          isError: true,
+          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        }]
       });
     } finally {
       setIsLoading(false);
@@ -303,7 +330,8 @@ export function AppProvider({ children }) {
         // Loading
         isLoading,
         // Chats
-        allChats, roleChats, activeChatId, activeChat,
+        companyChats, roleChats, activeChatId, activeChat,
+        uploadChat, isUploadTab,
         currentMessages, displayMessages,
         pushMessage, handleNewChat, switchChat,
         // Engine-derived (reactive)
