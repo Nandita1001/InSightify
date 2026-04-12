@@ -57,3 +57,31 @@ The platform can be used by individuals (via personal data uploads) or by compan
 - Shows how results were generated
 - Displays datasets used, columns involved, and rows analyzed
 - Indicates whether response is AI-powered or deterministic
+  
+## Live Demo
+https://your-vercel-link.vercel.app
+
+## Installation & Running the Project(Locally)
+
+### Requirements
+- Node.js (v16 or higher recommended)
+- Internet connection (for AI queries)
+
+### 1. Clone the repository
+```bash
+git clone https://github.com/TanishAhuja/talk-to-data.git
+cd talk-to-data
+```
+### 2. Install dependencies
+```bash
+npm install
+```
+### 3. Create a .env file in the root directory and add:
+```bash
+VITE_GROQ_API_KEY=your_api_key_here
+```
+### 4. Run the development server
+```bash
+npm run dev
+```
+
