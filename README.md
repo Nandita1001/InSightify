@@ -84,4 +84,98 @@ VITE_GROQ_API_KEY=your_api_key_here
 ```bash
 npm run dev
 ```
+## Tech Stack
+
+- **Frontend:** React (Vite)  
+- **Styling:** Tailwind CSS  
+- **Charts:** Recharts  
+- **Icons:** Lucide React  
+- **AI Integration:** Groq API (Model: llama-3.1-8b-instant)  
+- **State Management:** React Context API  
+- **Data Processing:** Custom deterministic analytics engine
+- - **File Parsing:** CSV/Excel parsing (via browser-based processing)  
+## Usage
+
+### 1. Querying Company Data
+- Select your role (Owner / Finance / HR / Marketing)
+- Ask questions in natural language
+- If data is restricted, request access and wait for approval
+
+Example:
+"What is the revenue by region?"
+"Which month had the worst customer feedback?"
+
+---
+
+### 2. Uploading Your Own Data
+- Switch to **My Data**
+- Upload a dataset (CSV / Excel / TSV)
+- Choose:
+  - Structured → for analytical queries
+  - Unstructured → for text-based queries
+- Ask questions directly
+
+Example:
+"When did the user log in?"
+"Summarize the error logs"
+
+---
+
+### 3. Understanding Results
+- View AI-generated answers and insights
+- Explore charts (bar, line, pie, table)
+- Check the **Trust Panel** for:
+  - datasets used  
+  - columns analyzed  
+  - method used  
+
+---
+
+## Screenshots
+### Main Interface – Chat-Based Data Interaction
+<img width="1365" height="678" alt="Screenshot 2026-04-12 230035" src="https://github.com/user-attachments/assets/e3e2019c-4297-49ba-b53c-544e8028f5b8" />
+The main interface allows users to interact with data using natural language. Users can select between Company Data and My Data, choose their role, and start asking questions instantly. Suggested queries are also provided to help users explore insights quickly.
+
+### AI-Powered Insights & Answers
+<img width="1365" height="685" alt="Screenshot 2026-04-12 223741" src="https://github.com/user-attachments/assets/507409d3-f553-4f2e-b093-35c5297dd682" />
+Users can ask questions in natural language and receive structured answers along with key insights. The system not only provides the final answer but also explains the reasoning and highlights important patterns in the data.
+
+### Data Visualization & Charts
+<img width="1364" height="681" alt="Screenshot 2026-04-12 223825" src="https://github.com/user-attachments/assets/8680e5ac-2626-48b3-9735-ecc8a35c463c" />
+The platform automatically converts analysis results into visual representations such as bar charts. This helps users quickly understand trends, comparisons, and patterns without manually creating graphs.
+
+### Explainability & Trust Panel
+<img width="1365" height="684" alt="Screenshot 2026-04-12 223837" src="https://github.com/user-attachments/assets/d2e7670e-ea5c-4390-ab4d-dcc524f9e44e" />
+InSightify provides a transparent view of how each answer is generated. Users can see the intent, datasets used, columns analyzed, number of rows processed, and the method applied. This ensures trust and makes the system’s reasoning clear and verifiable.
+
+### Access Control & Permission Request
+<img width="1365" height="680" alt="Screenshot 2026-04-12 224044" src="https://github.com/user-attachments/assets/cd0739b0-193a-4b85-bcd4-8a6f5248215b" />
+When users try to access restricted data, the system blocks the query and clearly shows which columns are restricted. Users can then request access directly, triggering a workflow where the data owner can approve or deny the request.
+
+### Owner Approval Workflow
+<img width="1365" height="682" alt="Screenshot 2026-04-12 225136" src="https://github.com/user-attachments/assets/b8946534-ec97-4791-bcc9-9eeb8f1a43fb" />
+Data owners can view all access requests in a dedicated panel and approve or deny them in real time. Once approved, the requesting team gains access instantly, enabling seamless and controlled data sharing.
+
+### Access Granted & Query Execution
+<img width="1365" height="685" alt="Screenshot 2026-04-12 224129" src="https://github.com/user-attachments/assets/9c0264c5-bbc7-4683-8b06-ed3478aefdae" />
+Once access is approved, users can re-run their query and successfully retrieve results. The system seamlessly removes restrictions and provides insights without requiring any additional steps.
+
+### Upload & Analyze Your Own Data
+<img width="1363" height="684" alt="Screenshot 2026-04-12 224147" src="https://github.com/user-attachments/assets/3f3fdfe0-5007-4ed5-8a7f-641e14fea461" />
+Users can switch to "My Data" mode and upload their own datasets. The platform allows selecting between structured and unstructured data, enabling flexible analysis based on the nature of the dataset.
+
+### Unstructured Data Querying
+<img width="1363" height="681" alt="Screenshot 2026-04-12 224321" src="https://github.com/user-attachments/assets/df58d7e7-34d9-45fe-8f39-ffcbc29e2aa2" />
+InSightify also supports unstructured datasets such as logs or text data. Users can upload such data and ask natural language questions, with the system extracting relevant information and generating meaningful answers.
+
+
+
+
+
+
+
+
+
+
+
 
