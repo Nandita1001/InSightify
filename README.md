@@ -170,6 +170,8 @@ InSightify also supports unstructured datasets such as logs or text data. Users 
 
 ## Architecture
 
+User Query → LLM → Intent Detection → Access Control → Execution → Response → Output
+
 InSightify follows a hybrid architecture combining AI-based query understanding with a deterministic analytics engine.
 
 1. **Query Understanding (LLM)**
@@ -204,8 +206,8 @@ InSightify follows a hybrid architecture combining AI-based query understanding 
 - Add user authentication and role management
 - Enhance NLP capabilities for more complex queries
 - Maintain full conversation context across chat history
-- Provide intelligent suggestions and recommendations based on previous queries(in "notes")
-
+- Provide intelligent suggestions and contextual recommendations based on chat history
+  
 ## Deployment
 
 The project is deployed on Vercel:
