@@ -93,7 +93,7 @@ npm run dev
 - **AI Integration:** Groq API (Model: llama-3.1-8b-instant)  
 - **State Management:** React Context API  
 - **Data Processing:** Custom deterministic analytics engine
-- - **File Parsing:** CSV/Excel parsing (via browser-based processing)  
+- **File Parsing:** CSV/Excel parsing (via browser-based processing)  
 ## Usage
 
 ### 1. Querying Company Data
