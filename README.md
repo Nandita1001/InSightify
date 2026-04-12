@@ -1,4 +1,4 @@
-# InSightify (https://insightify-sigma.vercel.app/)
+# InSightify 
 ## Overview
 
 InSightify is an intelligent data interaction platform that allows users to query datasets using natural language. It supports both structured and unstructured data, enabling users to choose the type of data they upload and interact with it accordingly.
