@@ -83,7 +83,115 @@ function extractFormulaColumns(formula, set) {
   extractFormulaColumns(formula.denominator, set);
 }
 
+async function callGroqForUnstructured(prompt) {
+  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("Groq API key is missing.");
+  }
+
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "llama-3.1-8b-instant",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => response.statusText);
+    throw new Error(`Groq API ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content?.trim();
+
+  if (!text) {
+    throw new Error("Groq returned empty response.");
+  }
+
+  return text;
+}
+
+function formatUnstructuredRows(rows = []) {
+  return rows
+    .map((row) =>
+      Object.values(row ?? {})
+        .filter((value) => value !== null && value !== undefined && String(value).trim() !== "")
+        .map((value) => String(value).trim())
+        .join(" | ")
+    )
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function handleUnstructuredQuery(question, dataset) {
+  try {
+    const datasetText = formatUnstructuredRows(dataset?.data ?? []).slice(0, 12000);
+
+    if (!datasetText) {
+      return {
+        type: "error",
+        message: "The unstructured dataset does not contain any readable text.",
+      };
+    }
+
+    const prompt = `You are a data analyst.
+
+User Question:
+${question}
+
+Dataset:
+${datasetText}
+
+Answer ONLY based on the dataset.
+Do not assume anything not present in the data.`;
+
+    const answer = await callGroqForUnstructured(prompt);
+
+    return {
+      type: "text",
+      answer,
+      source: "Unstructured Dataset (Groq)",
+    };
+  } catch (err) {
+    return {
+      type: "error",
+      message: `Unexpected error: ${err?.message ?? String(err)}`,
+    };
+  }
+}
+
 function formatForChart(result, chartType, intent) {
+  if (
+    result &&
+    !Array.isArray(result) &&
+    !result.counts &&
+    !result.groups &&
+    Object.entries(result).every(([, value]) => Array.isArray(value) || (value && typeof value === "object"))
+  ) {
+    return Object.entries(result).flatMap(([label, value]) => {
+      if (Array.isArray(value) && value.length > 0) {
+        const first = value[0];
+        const metricKey = Object.keys(first ?? {}).find((k) => typeof first[k] === "number" && !k.startsWith("_"));
+        const nameKey = Object.keys(first ?? {}).find((k) => typeof first[k] === "string" && !k.startsWith("_"));
+        if (metricKey) {
+          return [{
+            name: label,
+            value: Number(first[metricKey]),
+            label: nameKey ? String(first[nameKey]) : label,
+          }];
+        }
+      }
+      return [];
+    });
+  }
+
   // ── sentimentScan special handling ──
   if (result && result.counts && result.groups !== undefined) {
     // If we have groupRanking (temporal/dimensional breakdown), use it for bar chart
@@ -184,6 +292,277 @@ function getMetricDefinitions(columns) {
   return DATA_DICTIONARY.filter(d => lowerCols.includes(d.name.toLowerCase()));
 }
 
+function isSentimentQuestion(question = "") {
+  return /\bhappy\b|\bhappiness\b|\bsatisfied?\b|\bsatisfaction\b|\bfeel(?:ing|ings)?\b|\bfeedback\b|\bcomplaints?\b|\breviews?\b|\bunhappy\b|\bdissatisfied\b|\bsentiment\b/i.test(question);
+}
+
+function findFeedbackDatasetSummary(datasets = []) {
+  return datasets.find((ds) =>
+    ds?.id === "customer_feedback" ||
+    ds?.name?.toLowerCase().includes("customer feedback") ||
+    ds?.name?.toLowerCase().includes("feedback")
+  ) ?? null;
+}
+
+function normalizeAnalysisTypes(analysis = [], intent = "summary", question = "") {
+  const normalized = []
+    .concat(analysis ?? [])
+    .concat(!analysis?.length && intent ? [intent] : [])
+    .map((value) => String(value).toLowerCase().trim())
+    .flatMap((value) => {
+      if (!value) return [];
+      if (["highest", "top", "best", "most", "maximum", "max"].includes(value)) return ["max"];
+      if (["lowest", "bottom", "worst", "least", "minimum", "min"].includes(value)) return ["min"];
+      if (value === "ranking") return /\b(lowest|bottom|worst|least|min|minimum)\b/i.test(question) ? ["min"] : ["max"];
+      return [value];
+    });
+
+  return [...new Set(normalized)];
+}
+
+function normalizePlannerPlan(plan, question = "") {
+  if (!plan) return null;
+
+  const dataset = typeof plan.dataset === "string" && plan.dataset
+    ? plan.dataset
+    : (Array.isArray(plan.datasets) ? plan.datasets[0] : "");
+  const metrics = Array.isArray(plan.metrics)
+    ? plan.metrics.filter((value) => typeof value === "string" && value)
+    : (Array.isArray(plan.columns) ? plan.columns.filter((value) => typeof value === "string" && value) : []);
+  const dimensions = Array.isArray(plan.dimensions)
+    ? plan.dimensions.filter((value) => typeof value === "string" && value)
+    : [];
+  const analysis = normalizeAnalysisTypes(plan.analysis, plan.intent, question);
+
+  return {
+    ...plan,
+    dataset,
+    datasets: dataset ? [dataset] : (Array.isArray(plan.datasets) ? plan.datasets : []),
+    metrics,
+    dimensions,
+    analysis: analysis.length > 0 ? analysis : ["summary"],
+    columns: [...new Set([...metrics, ...dimensions])],
+  };
+}
+
+function fuzzyMatchColumnName(name, knownCols) {
+  if (!name) return name;
+  const lower = name.toLowerCase();
+  const knownColsLower = new Set(knownCols.map((c) => c.toLowerCase()));
+  if (knownColsLower.has(lower)) {
+    return knownCols.find((c) => c.toLowerCase() === lower) ?? name;
+  }
+
+  const bySubstring = knownCols.find(
+    (k) => k.toLowerCase().includes(lower) || lower.includes(k.toLowerCase())
+  );
+  if (bySubstring) return bySubstring;
+
+  const tokens = lower.split(/[_\s]+/).filter(Boolean);
+  let bestScore = 0;
+  let bestCol = null;
+  for (const k of knownCols) {
+    const kTokens = k.toLowerCase().split(/[_\s]+/);
+    const score = tokens.filter((t) => kTokens.some((kt) => kt.includes(t) || t.includes(kt))).length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestCol = k;
+    }
+  }
+  return bestScore > 0 ? bestCol : null;
+}
+
+function repairPlannerColumns(plan, targetSummary) {
+  if (!plan || !targetSummary) return { plan, unfixableCount: 0 };
+  const knownCols = (targetSummary.columns ?? []).map((c) => c.name);
+  const fixedPlan = { ...plan };
+  let unfixableCount = 0;
+
+  for (const key of ["metrics", "dimensions"]) {
+    const values = Array.isArray(fixedPlan[key]) ? fixedPlan[key] : [];
+    fixedPlan[key] = values
+      .map((value) => {
+        const fixed = fuzzyMatchColumnName(value, knownCols);
+        if (!fixed) unfixableCount++;
+        return fixed;
+      })
+      .filter(Boolean);
+  }
+
+  fixedPlan.columns = [...new Set([...(fixedPlan.metrics ?? []), ...(fixedPlan.dimensions ?? [])])];
+  return { plan: fixedPlan, unfixableCount };
+}
+
+function combineMetadata(base, next) {
+  if (!next) return base;
+  return {
+    columnsUsed: [...new Set([...(base.columnsUsed || []), ...(next.columnsUsed || [])])].filter(Boolean),
+    rowsAnalyzed: Math.max(base.rowsAnalyzed || 0, next.rowsAnalyzed || 0),
+    method: base.method ? `${base.method} | ${next.method}` : (next.method || ""),
+    filters: base.filters && next.filters ? `${base.filters} AND ${next.filters}` : (base.filters || next.filters || null),
+    analysisKeys: [...new Set([...(base.analysisKeys || []), ...(next.analysisKeys || [])])],
+  };
+}
+
+function buildExecutionSteps(plan, dataset) {
+  const columns = dataset?.columns ?? [];
+  const numericCols = columns.filter((c) => c.type === "numeric").map((c) => c.name);
+  const textCols = columns.filter((c) => c.type === "text").map((c) => c.name);
+  const categoricalCols = columns.filter((c) => c.type === "categorical").map((c) => c.name);
+  const dateCols = columns.filter((c) => c.type === "date").map((c) => c.name);
+  const metrics = (plan.metrics ?? []).filter((c) => numericCols.includes(c) || textCols.includes(c) || categoricalCols.includes(c));
+  const dimensions = (plan.dimensions ?? []).filter((c) => categoricalCols.includes(c) || dateCols.includes(c));
+  const primaryMetric = metrics.find((c) => numericCols.includes(c)) ?? metrics[0] ?? numericCols[0] ?? textCols[0] ?? null;
+  const primaryDimension = dimensions[0] ?? categoricalCols[0] ?? dateCols[0] ?? null;
+  const timeCol = dimensions.find((c) => dateCols.includes(c)) ?? dateCols[0] ?? null;
+  const textCol = metrics.find((c) => textCols.includes(c)) ?? textCols[0] ?? null;
+  const analyses = normalizeAnalysisTypes(plan.analysis, plan.intent);
+  const steps = [];
+
+  for (const analysis of analyses) {
+    switch (analysis) {
+      case "max":
+        if (primaryMetric) steps.push({ key: "max", type: "topN", metricCol: primaryMetric, groupCol: primaryDimension, direction: "top", n: 1 });
+        break;
+      case "min":
+        if (primaryMetric) steps.push({ key: "min", type: "topN", metricCol: primaryMetric, groupCol: primaryDimension, direction: "bottom", n: 1 });
+        break;
+      case "trend":
+        if (primaryMetric && (timeCol || primaryDimension)) steps.push({ key: "trend", type: "trend", metricCol: primaryMetric, timeCol: timeCol ?? primaryDimension, groupCol: dimensions.find((c) => c !== (timeCol ?? primaryDimension)) ?? null });
+        break;
+      case "comparison":
+        if (primaryDimension && metrics.length > 0) steps.push({ key: "comparison", type: "compare", groupCol: primaryDimension, metricCols: metrics.filter((c) => numericCols.includes(c)) });
+        break;
+      case "sentiment":
+        if (textCol) steps.push({ key: "sentiment", type: "sentimentScan", textCol, groupCol: primaryDimension });
+        break;
+      case "breakdown":
+        if (primaryMetric && primaryDimension) steps.push({ key: "breakdown", type: "breakdown", metricCol: primaryMetric, groupCol: primaryDimension });
+        break;
+      case "anomaly":
+        if (primaryMetric) steps.push({ key: "anomaly", type: "anomaly", metricCol: primaryMetric, threshold: 20 });
+        break;
+      case "correlation": {
+        const numericMetrics = metrics.filter((c) => numericCols.includes(c));
+        if (numericMetrics.length >= 2) steps.push({ key: "correlation", type: "correlation", col1: numericMetrics[0], col2: numericMetrics[1] });
+        break;
+      }
+      case "computed_metric":
+        if (numericCols.length >= 2) steps.push({ key: "computed_metric", type: "computeMetric", formula: { operation: "subtract", left: numericCols[0], right: numericCols[1] }, resultName: "Computed Metric", groupCol: primaryDimension });
+        break;
+      case "text_search":
+        if (textCol) steps.push({ key: "text_search", type: "searchText", textCol, query: "" });
+        break;
+      case "summary":
+      default:
+        if (metrics.length > 0 || numericCols.length > 0) {
+          steps.push({ key: "summary", type: "summarize", columns: metrics.filter((c) => numericCols.includes(c)).length > 0 ? metrics.filter((c) => numericCols.includes(c)) : numericCols.slice(0, 6) });
+        }
+        break;
+    }
+  }
+
+  return steps;
+}
+
+function executeStep(step, data) {
+  const baseMeta = { columnsUsed: [], rowsAnalyzed: 0, method: "", filters: null, analysisKeys: [step.key] };
+
+  switch (step.type) {
+    case "topN": {
+      if (step.groupCol) {
+        const aggregated = aggregate(data, step.metricCol, step.groupCol, "sum");
+        if (!aggregated?.result) return aggregated;
+        const ranked = topN(aggregated.result, step.metricCol, step.n, step.direction);
+        return {
+          result: ranked.result,
+          metadata: combineMetadata(combineMetadata(baseMeta, aggregated.metadata), ranked.metadata),
+        };
+      }
+      const ranked = topN(data, step.metricCol, step.n, step.direction);
+      return {
+        ...ranked,
+        metadata: combineMetadata(baseMeta, ranked.metadata),
+      };
+    }
+    case "trend": {
+      const result = trend(data, step.timeCol, step.metricCol, step.groupCol ?? null);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "compare": {
+      const result = compare(data, step.groupCol, step.metricCols);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "breakdown": {
+      const result = breakdown(data, step.metricCol, step.groupCol);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "anomaly": {
+      const result = anomaly(data, step.metricCol, step.threshold);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "correlation": {
+      const result = correlation(data, step.col1, step.col2);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "computeMetric": {
+      const result = computeMetric(data, step.formula, step.resultName, step.groupCol);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "searchText": {
+      const result = searchText(data, step.textCol, step.query);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "sentimentScan": {
+      const result = sentimentScan(data, step.textCol, step.groupCol ?? null);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+    case "summarize":
+    default: {
+      const result = summarize(data, step.columns);
+      return { ...result, metadata: combineMetadata(baseMeta, result.metadata) };
+    }
+  }
+}
+
+function repairSentimentPlan(plan, question, availableDatasets) {
+  if (!plan) return plan;
+
+  const feedbackDataset = findFeedbackDatasetSummary(availableDatasets);
+  const datasetColumns = feedbackDataset?.columns ?? [];
+  const textCol = datasetColumns.find((c) => c.type === "text")?.name ?? "text";
+  const groupCol =
+    datasetColumns.find((c) => c.name.toLowerCase() === "region")?.name ??
+    datasetColumns.find((c) => c.type === "categorical")?.name ??
+    datasetColumns.find((c) => c.type === "date")?.name ??
+    null;
+  const datasetLooksLikeFeedback = (plan.datasets ?? []).some((ds) =>
+    String(ds).toLowerCase().includes("feedback") || String(ds).toLowerCase() === "customer_feedback"
+  );
+  const shouldForceSentiment =
+    isSentimentQuestion(question) ||
+    plan.intent === "sentiment" ||
+    datasetLooksLikeFeedback;
+
+  if (!shouldForceSentiment) return plan;
+
+  const safeColumns = [textCol, groupCol].filter(Boolean);
+
+  return {
+    ...plan,
+    intent: "sentiment",
+    dataset: feedbackDataset?.id ?? plan.dataset ?? "",
+    datasets: feedbackDataset ? [feedbackDataset.id] : (plan.datasets ?? []),
+    metrics: [textCol],
+    dimensions: groupCol ? [groupCol] : [],
+    analysis: ["sentiment"],
+    columns: safeColumns,
+    operations: [],
+    chartType: "pie",
+    title: plan.title || "Sentiment Analysis",
+  };
+}
+
 /* ═══════════════════════════════════════════════════════════
    MAIN EXPORT
 ═══════════════════════════════════════════════════════════ */
@@ -234,52 +613,26 @@ export async function processQuery(
     /* ── Step 2: Parse the question into an analysis plan ── */
     let analysisPlan;
     try {
-      analysisPlan = await parseQuery(question, availableDatasets, conversationContext);
-
-      // ── Validate: check that operation column params actually exist in the dataset ──
-      // If Groq hallucinated column names, fall back to the local parser.
-      if (analysisPlan) {
-        const targetSummary = availableDatasets.find((ds) =>
-          analysisPlan.datasets?.some((n) =>
-            ds.name.toLowerCase().includes(n.toLowerCase()) ||
-            n.toLowerCase().includes(ds.name.toLowerCase().split(" ")[0])
-          )
-        ) ?? availableDatasets[0];
-
-        const knownCols = new Set(
-          (targetSummary?.columns ?? []).map((c) => c.name.toLowerCase())
-        );
-
-        // Collect every single-string column param from the plan
-        const planCols = [];
-        for (const op of analysisPlan.operations ?? []) {
-          const p = op.params ?? {};
-          for (const key of ["metricCol", "groupCol", "timeCol", "column", "col1", "col2", "textCol"]) {
-            if (typeof p[key] === "string" && p[key]) planCols.push(p[key]);
-          }
-          for (const arr of [p.metricCols, p.columns].filter(Array.isArray)) {
-            for (const c of arr) if (typeof c === "string" && c) planCols.push(c);
-          }
-        }
-
-        // If any named column is unknown to the dataset, local parser is more reliable
-        const hasInvalidCol = planCols.some(
-          (c) => knownCols.size > 0 && !knownCols.has(c.toLowerCase())
-        );
-        if (hasInvalidCol) {
-          console.warn("[queryEngine] Groq plan had invalid columns, falling back to local parser.", planCols);
-          analysisPlan = fallbackParseQuery(question, availableDatasets);
-        }
-      }
+      analysisPlan = normalizePlannerPlan(
+        repairSentimentPlan(await parseQuery(question, availableDatasets, conversationContext), question, availableDatasets),
+        question
+      );
     } catch {
-      analysisPlan = fallbackParseQuery(question, availableDatasets);
+      try {
+        analysisPlan = normalizePlannerPlan(
+          repairSentimentPlan(fallbackParseQuery(question, availableDatasets), question, availableDatasets),
+          question
+        );
+      } catch (fallbackErr) {
+        console.error("[queryEngine] Both API and local parser failed:", fallbackErr.message);
+        analysisPlan = null;
+      }
     }
 
     // Validate the plan has enough to work with
     if (
       !analysisPlan ||
-      (analysisPlan.datasets ?? []).length === 0 ||
-      (analysisPlan.operations ?? []).length === 0
+      !analysisPlan.dataset
     ) {
       return {
         type: "error",
@@ -295,7 +648,7 @@ export async function processQuery(
 
     for (const dsName of plan.datasets) {
       // Pass 1 — exact / substring name match in registry
-      let found = findDatasetByName(dsName);
+      let found = findDatasetByName(dsName) ?? getDataset(dsName);
 
       if (!found) {
         // Pass 2 — partial word match: tokenise the plan name and score candidates
@@ -341,156 +694,125 @@ export async function processQuery(
     // Primary dataset drives the operation pipeline; extras are available for joins
     const targetDataset = resolvedDatasets[0];
 
-    /* ── Step 4: Collect all required columns ── */
-    // Seed from the top-level columns list the planner emitted
-    const allRequiredColumns = new Set(plan.columns ?? []);
+    if (targetDataset?.type === "unstructured") {
+      return await handleUnstructuredQuery(question, targetDataset);
+    }
 
-    for (const op of plan.operations) {
-      const p = op.params ?? {};
+    const repaired = repairPlannerColumns(plan, availableDatasets.find((ds) => ds.id === targetDataset.id) ?? availableDatasets[0]);
+    analysisPlan = {
+      ...analysisPlan,
+      ...repaired.plan,
+      dataset: targetDataset.id,
+      datasets: [targetDataset.id],
+    };
+    const planWithDataset = analysisPlan;
+    const executionSteps = buildExecutionSteps(planWithDataset, targetDataset);
 
-      // Single-column params
-      for (const key of ["metricCol", "groupCol", "timeCol", "column", "col1", "col2", "textCol"]) {
-        if (typeof p[key] === "string" && p[key]) allRequiredColumns.add(p[key]);
+    if (repaired.unfixableCount > 0 || executionSteps.length === 0) {
+      try {
+        const fallbackPlan = normalizePlannerPlan(
+          repairSentimentPlan(fallbackParseQuery(question, availableDatasets), question, availableDatasets),
+          question
+        );
+        const fallbackRepaired = repairPlannerColumns(fallbackPlan, availableDatasets.find((ds) => ds.id === targetDataset.id) ?? availableDatasets[0]);
+        analysisPlan = {
+          ...fallbackPlan,
+          ...fallbackRepaired.plan,
+          dataset: targetDataset.id,
+          datasets: [targetDataset.id],
+        };
+      } catch {
+        analysisPlan = planWithDataset;
       }
+    }
 
-      // Array-of-column params
-      for (const arr of [p.metricCols, p.columns].filter(Array.isArray)) {
+    const finalPlan = analysisPlan;
+    const finalSteps = buildExecutionSteps(finalPlan, targetDataset);
+
+    if (finalSteps.length === 0) {
+      return {
+        type: "error",
+        message: "I couldn't build a valid analysis plan for that question.",
+      };
+    }
+
+    /* ── Step 4: Collect all required columns ── */
+    const allRequiredColumns = new Set([
+      ...(finalPlan.metrics ?? []),
+      ...(finalPlan.dimensions ?? []),
+      ...(finalPlan.columns ?? []),
+    ]);
+
+    for (const step of finalSteps) {
+      for (const key of ["metricCol", "groupCol", "timeCol", "column", "col1", "col2", "textCol"]) {
+        if (typeof step[key] === "string" && step[key]) allRequiredColumns.add(step[key]);
+      }
+      for (const arr of [step.metricCols, step.columns].filter(Array.isArray)) {
         for (const c of arr) if (typeof c === "string" && c) allRequiredColumns.add(c);
       }
-
-      // Recursive formula extraction (computeMetric)
-      if (p.formula) extractFormulaColumns(p.formula, allRequiredColumns);
+      if (step.formula) extractFormulaColumns(step.formula, allRequiredColumns);
     }
 
     /* ── Step 5: Access control — MUST run before any data processing ── */
     const accessResult = checkAccess(role, Array.from(allRequiredColumns));
 
     if (!accessResult.allowed) {
+      const accessRequest = createAccessRequest(
+        role,
+        accessResult.blockedColumns.map((c) => c.col),
+        `Auto-generated from query: ${question}`
+      );
       return {
         type: "blocked",
         blockedColumns: accessResult.blockedColumns, // [{ col, reason }]
         role,
+        accessRequest,
+        restrictions: getRestrictions(role),
       };
     }
 
     /* ── Step 6: Execute the operations ── */
     let data = resolvedDatasets[0].data;
     let analysisResult = null;
+    const combinedResults = {};
 
     let allMetadata = {
       columnsUsed: [],
       rowsAnalyzed: 0,
       method: "",
-      filters: null
-    };
-
-    // Operation dispatcher — maps function name → actual import
-    const OPS = {
-      aggregate, filter, sort, topN, trend, compare, breakdown,
-      anomaly, correlation, computeMetric, joinDatasets, summarize,
-      rankColumns, searchText, extractThemes, sentimentScan
+      filters: null,
+      analysisKeys: [],
     };
 
     const executionLog = [];
 
-    for (const op of plan.operations ?? []) {
-      const fn = OPS[op.function];
-      if (!fn) {
-        executionLog.push({ op: op.function, error: "Unknown operation" });
-        continue;
-      }
-
+    for (const step of finalSteps) {
       try {
-        const p = op.params ?? {};
-        let opResult;
-
-        switch (op.function) {
-          case "aggregate":
-            opResult = fn(data, p.metricCol, p.groupCol, p.aggType);
-            break;
-          case "filter":
-            opResult = fn(data, p.column, p.operator, p.value);
-            data = opResult.result; // filter mutates working set
-            break;
-          case "sort":
-            opResult = fn(data, p.column, p.direction);
-            break;
-          case "topN":
-            opResult = fn(data, p.metricCol, p.n, p.direction);
-            break;
-          case "trend":
-            opResult = fn(data, p.timeCol, p.metricCol, p.groupCol);
-            break;
-          case "compare":
-            opResult = fn(data, p.groupCol, p.metricCols);
-            break;
-          case "breakdown":
-            opResult = fn(data, p.metricCol, p.groupCol);
-            break;
-          case "anomaly":
-            opResult = fn(data, p.metricCol, p.threshold);
-            break;
-          case "correlation":
-            opResult = fn(data, p.col1, p.col2);
-            break;
-          case "computeMetric":
-            opResult = fn(data, p.formula, p.resultName, p.groupCol);
-            break;
-          case "joinDatasets": {
-            const ds2 = p.dataset2 ? (findDatasetByName(p.dataset2) ?? getDataset(p.dataset2)) : null;
-            if (ds2) {
-              opResult = fn(data, ds2.data, p.joinCol);
-              data = opResult.result; // joins mutate working set
-            } else {
-              opResult = { result: data, metadata: { method: "joinDatasets skipped", columnsUsed: [], rowsAnalyzed: 0, filters: null } };
-            }
-            break;
-          }
-          case "summarize":
-            opResult = fn(data, p.columns);
-            break;
-          case "rankColumns":
-            opResult = fn(data, p.columns, p.direction ?? "top");
-            break;
-          case "searchText":
-            opResult = fn(data, p.textCol, p.query);
-            break;
-          case "extractThemes":
-            opResult = fn(data, p.textCol);
-            break;
-          case "sentimentScan":
-            opResult = fn(data, p.textCol, p.groupCol ?? null);
-            break;
-          default:
-             opResult = { result: data, metadata: { method: op.function, columnsUsed: [], rowsAnalyzed: data.length, filters: null } };
-        }
+        const opResult = executeStep(step, data);
 
         if (opResult) {
           analysisResult = opResult;
-          executionLog.push({ op: op.function, ...opResult });
-
-          const m = opResult.metadata;
-          if (m) {
-            allMetadata.columnsUsed = [...new Set([...allMetadata.columnsUsed, ...(m.columnsUsed || [])])].filter(Boolean);
-            allMetadata.rowsAnalyzed = Math.max(allMetadata.rowsAnalyzed, m.rowsAnalyzed || 0);
-            allMetadata.method = allMetadata.method ? allMetadata.method + " → " + m.method : m.method;
-            if (m.filters) {
-              allMetadata.filters = allMetadata.filters ? allMetadata.filters + " AND " + m.filters : m.filters;
-            }
+          combinedResults[step.key] = opResult.result;
+          executionLog.push({ op: step.key, ...opResult });
+          if (opResult.metadata) {
+            allMetadata = combineMetadata(allMetadata, opResult.metadata);
           }
         }
       } catch (err) {
-        console.error("Operation failed:", op.function, err);
-        executionLog.push({ op: op.function, error: String(err) });
+        console.error("Operation failed:", step.key, err);
+        executionLog.push({ op: step.key, error: String(err) });
       }
     }
 
     if (!analysisResult) {
       return { type: "error", message: "No valid operations could be executed for this question." };
     }
+    analysisResult = finalSteps.length === 1
+      ? analysisResult
+      : { result: combinedResults, metadata: allMetadata };
 
     /* ── Step 7: Generate narrative ── */
-    /* ── Step 8: Generate narrative ── */
+    const activePlan = finalPlan;
     let narrative = "";
     const metricDefs = getMetricDefinitions(allMetadata.columnsUsed);
     try {
@@ -505,18 +827,20 @@ export async function processQuery(
     /* ── Step 9: Final return ── */
     // Override chartType for sentiment+groupRanking to bar (plan might say "pie")
     const hasGroupRanking = analysisResult.result?.groupRanking?.length > 0;
-    const effectiveChartType = hasGroupRanking ? "bar" : (plan.chartType || "bar");
+    const effectiveChartType = hasGroupRanking
+      ? "bar"
+      : ((allMetadata.analysisKeys?.length ?? 0) > 1 ? "bar" : (activePlan.chartType || "bar"));
 
-    const chartData = formatForChart(analysisResult.result, effectiveChartType, plan.intent);
+    const chartData = formatForChart(analysisResult.result, effectiveChartType, activePlan.intent);
 
     return {
       type: "success",
       narrative,
       chartData,
       chartType: effectiveChartType,
-      title: plan.title || `${plan.intent} analysis`,
+      title: activePlan.title || `${activePlan.intent} analysis`,
       trust: {
-        intent: plan.intent,
+        intent: activePlan.intent,
         datasetsUsed: resolvedDatasets.map(d => d.name),
         columnsUsed: allMetadata.columnsUsed,
         rowsAnalyzed: allMetadata.rowsAnalyzed,
@@ -549,7 +873,6 @@ export function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owne
 
     const salesQs = [
       "What is the revenue by region?",
-      "Show top 3 products by revenue",
       "How did revenue trend month over month?",
       "Which channel generates the most revenue?",
       "What is the breakdown of units sold by product?",
@@ -580,13 +903,13 @@ export function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owne
         ];
 
     const feedbackQs = (isFinance || isHR)
-      ? []  // Finance and HR are blocked from raw text
+      ? ["Which month had the worst customer feedback?"]
       : [
           "Which month had the worst customer feedback?",
           "What are the main complaints in customer feedback?",
         ];
 
-    return [...salesQs.slice(0, 2), ...customerQs.slice(0, 1), ...costQs.slice(0, 1), ...feedbackQs.slice(0, 1)];
+    return [...salesQs.slice(0, 1), ...customerQs.slice(0, 1), ...costQs.slice(0, 1), ...feedbackQs.slice(0, 1)];
   }
 
   if (activeTab === "upload" && uploadedDatasetId) {

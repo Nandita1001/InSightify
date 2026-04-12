@@ -39,10 +39,10 @@ export default function Header() {
             className="text-lg font-bold tracking-tight"
             style={{ fontFamily: "'JetBrains Mono', monospace", color: "#1a1a2e" }}
           >
-            TalkToData
+            InSightify
           </h1>
           <p className="text-xs font-medium" style={{ color: "#9ca3af" }}>
-            Self-Service Intelligence
+            Talk to Your Data
           </p>
         </div>
       </div>

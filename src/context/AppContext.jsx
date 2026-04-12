@@ -45,6 +45,7 @@ export function AppProvider({ children }) {
   /* ── Upload state ── */
   const [uploadedFile, setUploadedFile]         = useState(null);   // File object
   const [uploadedDatasetId, setUploadedDatasetId] = useState(null);
+  const [uploadedDataType, setUploadedDataType] = useState("structured");
 
   /* ── Loading ── */
   const [isLoading, setIsLoading]       = useState(false);
@@ -149,6 +150,7 @@ export function AppProvider({ children }) {
       if (uploadedDatasetId) removeDataset(uploadedDatasetId);
       setUploadedFile(null);
       setUploadedDatasetId(null);
+      setUploadedDataType("structured");
     } else {
       const newId = Date.now();
       setCompanyChats((prev) => {
@@ -225,6 +227,20 @@ export function AppProvider({ children }) {
           isError: true,
           time,
         });
+      } else if (result.type === "text") {
+        pushMessage({
+          role: "assistant",
+          content: result.answer,
+          trust: {
+            source: result.source,
+            method: "LLM answer from uploaded unstructured dataset",
+            datasetsUsed: result.datasetName ? [result.datasetName] : [],
+            columnsUsed: [],
+            rowsAnalyzed: result.rowCount ?? 0,
+            aiPowered: true,
+          },
+          time,
+        });
       } else {
         // success
         pushMessage({
@@ -251,7 +267,7 @@ export function AppProvider({ children }) {
   };
 
   /* ── CSV / Excel upload ── */
-  const handleFileUpload = async (file) => {
+  const handleFileUpload = async (file, datasetType = "structured") => {
     if (!file) return;
     setIsLoading(true);
 
@@ -262,9 +278,13 @@ export function AppProvider({ children }) {
       // Remove old upload from registry
       if (uploadedDatasetId) removeDataset(uploadedDatasetId);
 
-      const entry = await registerCSV(file, { name: file.name.replace(/\.[^.]+$/, "") });
+      const entry = await registerCSV(file, {
+        name: file.name.replace(/\.[^.]+$/, ""),
+        type: datasetType,
+      });
       setUploadedFile(file);
       setUploadedDatasetId(entry.id);
+      setUploadedDataType(entry.type);
 
       // Build column summary narrative
       const colLines = entry.columns
@@ -326,6 +346,7 @@ export function AppProvider({ children }) {
         notification, showNotif,
         // File
         uploadedFile, uploadedDatasetId,
+        uploadedDataType, setUploadedDataType,
         handleFileUpload,
         // Loading
         isLoading,

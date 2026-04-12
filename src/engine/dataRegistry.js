@@ -285,7 +285,10 @@ const _registry = new Map();
  * @param {{ id, name, description, data, columns }} entry
  */
 function _register(entry) {
-  _registry.set(entry.id, entry);
+  _registry.set(entry.id, {
+    ...entry,
+    type: entry.type === "unstructured" ? "unstructured" : "structured",
+  });
 }
 
 /* ─────────────────────────────────────────────
@@ -382,7 +385,7 @@ export function findDatasetByName(name) {
  * Auto-profiles all columns and adds the dataset to the registry.
  *
  * @param {File} file  — browser File object from <input type="file">
- * @param {{ name?: string, description?: string }} [meta] — optional overrides
+ * @param {{ name?: string, description?: string, type?: "structured"|"unstructured" }} [meta] — optional overrides
  * @returns {Promise<object>}  — the new registry entry
  */
 export function registerCSV(file, meta = {}) {
@@ -410,6 +413,7 @@ export function registerCSV(file, meta = {}) {
           id,
           name,
           description,
+          type: meta.type === "unstructured" ? "unstructured" : "structured",
           rowCount: rows.length,
           columns: profileData(rows), // no hints for user uploads — fully auto
           data: rows,

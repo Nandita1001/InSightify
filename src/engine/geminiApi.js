@@ -107,20 +107,63 @@ async function _callGemini(prompt, system = null) {
 
 
 /** Validate and coerce an analysis plan object so consumers never crash. */
-function _normalizePlan(raw) {
+function _normalizeAnalysisList(rawAnalysis, rawIntent, question = "") {
+  const ANALYSES = [
+    "max", "min", "trend", "comparison", "breakdown",
+    "summary", "anomaly", "correlation", "computed_metric",
+    "text_search", "sentiment",
+  ];
+
+  const fromRaw = []
+    .concat(rawAnalysis ?? [])
+    .concat(rawIntent ? [rawIntent] : [])
+    .map((v) => String(v).toLowerCase().trim())
+    .flatMap((v) => {
+      if (!v) return [];
+      if (["highest", "top", "best", "most", "maximum", "max"].includes(v)) return ["max"];
+      if (["lowest", "bottom", "worst", "least", "minimum", "min"].includes(v)) return ["min"];
+      if (v === "ranking") return /\b(lowest|bottom|worst|least|min|minimum)\b/i.test(question) ? ["min"] : ["max"];
+      return [v];
+    })
+    .filter((v) => ANALYSES.includes(v));
+
+  return [...new Set(fromRaw)];
+}
+
+function _normalizePlan(raw, question = "") {
   const INTENTS = [
     "breakdown", "comparison", "trend", "summary", "ranking", "anomaly",
-    "correlation", "computed_metric", "text_search", "sentiment",
+    "correlation", "computed_metric", "text_search", "sentiment", "aggregate",
   ];
-  const CHARTS = ["pie", "bar", "line", "table", "none"];
+  const dataset = typeof raw?.dataset === "string" && raw.dataset
+    ? raw.dataset
+    : (Array.isArray(raw?.datasets) ? raw.datasets[0] : "");
+  const metrics = Array.isArray(raw?.metrics)
+    ? raw.metrics.filter((v) => typeof v === "string" && v)
+    : (Array.isArray(raw?.columns) ? raw.columns.filter((v) => typeof v === "string" && v) : []);
+  const dimensions = Array.isArray(raw?.dimensions)
+    ? raw.dimensions.filter((v) => typeof v === "string" && v)
+    : [];
+  const analysis = _normalizeAnalysisList(raw?.analysis, raw?.intent, question);
+  const intent = INTENTS.includes(raw?.intent) ? raw.intent : (
+    analysis.includes("sentiment") ? "sentiment" :
+    analysis.includes("comparison") ? "comparison" :
+    analysis.includes("trend") ? "trend" :
+    analysis.includes("max") || analysis.includes("min") ? "ranking" :
+    "summary"
+  );
 
   return {
-    intent: INTENTS.includes(raw.intent) ? raw.intent : "summary",
-    datasets: Array.isArray(raw.datasets) ? raw.datasets : [],
-    columns: Array.isArray(raw.columns) ? raw.columns : [],
-    operations: Array.isArray(raw.operations) ? raw.operations : [],
-    chartType: CHARTS.includes(raw.chartType) ? raw.chartType : "table",
-    title: typeof raw.title === "string" ? raw.title : "Analysis",
+    intent,
+    dataset,
+    metrics,
+    dimensions,
+    analysis: analysis.length > 0 ? analysis : [intent === "ranking" ? "max" : intent],
+    datasets: dataset ? [dataset] : [],
+    columns: [...new Set([...metrics, ...dimensions])],
+    operations: Array.isArray(raw?.operations) ? raw.operations : [],
+    chartType: typeof raw?.chartType === "string" ? raw.chartType : "table",
+    title: typeof raw?.title === "string" ? raw.title : "Analysis",
   };
 }
 
@@ -146,6 +189,53 @@ function _buildContextText(conversationContext) {
     .join("\n");
 }
 
+function _isSentimentQuery(question = "") {
+  return /\bhappy\b|\bhappiness\b|\bsatisfied?\b|\bsatisfaction\b|\bfeel(?:ing|ings)?\b|\bfeedback\b|\bcomplaints?\b|\breviews?\b|\bunhappy\b|\bdissatisfied\b|\bsentiment\b/i.test(question);
+}
+
+function _findFeedbackDataset(registryMetadata = []) {
+  return registryMetadata.find((ds) =>
+    ds?.id === "customer_feedback" ||
+    ds?.name?.toLowerCase().includes("customer feedback") ||
+    ds?.name?.toLowerCase().includes("feedback")
+  ) ?? null;
+}
+
+function _coerceSentimentPlan(plan, question, registryMetadata) {
+  const feedbackDataset = _findFeedbackDataset(registryMetadata);
+  const datasetColumns = feedbackDataset?.columns ?? [];
+  const textCol = datasetColumns.find((c) => c.type === "text")?.name ?? "text";
+  const groupCol =
+    datasetColumns.find((c) => c.name.toLowerCase() === "region")?.name ??
+    datasetColumns.find((c) => c.type === "categorical")?.name ??
+    datasetColumns.find((c) => c.type === "date")?.name ??
+    null;
+  const sentimentTriggered =
+    _isSentimentQuery(question) ||
+    plan?.intent === "sentiment" ||
+    (plan?.datasets ?? []).some((ds) => String(ds).toLowerCase().includes("feedback"));
+
+  if (!sentimentTriggered) return plan;
+
+  const safeColumns = [textCol, groupCol].filter(Boolean);
+
+  return {
+    ...plan,
+    intent: "sentiment",
+    dataset: feedbackDataset?.id ?? plan?.dataset ?? "",
+    metrics: [textCol],
+    dimensions: groupCol ? [groupCol] : [],
+    analysis: ["sentiment"],
+    datasets: feedbackDataset ? [feedbackDataset.id] : (plan?.datasets ?? []),
+    columns: safeColumns,
+    operations: [],
+    chartType: "pie",
+    title: typeof plan?.title === "string" && plan.title.trim()
+      ? plan.title
+      : "Sentiment Analysis",
+  };
+}
+
 /* ═══════════════════════════════════════════════════════════
    §2  PUBLIC UTILITY
 ═══════════════════════════════════════════════════════════ */
@@ -163,24 +253,31 @@ export function isApiAvailable() {
    §3  parseQuery
 ═══════════════════════════════════════════════════════════ */
 
-const PARSE_QUERY_SYSTEM = `You are a data analysis query parser. Given a user's question and available datasets, determine the analysis plan.
-
-RESPOND WITH ONLY VALID JSON, no markdown, no backticks, no explanation. Use this exact structure:
-{"intent":"breakdown|comparison|trend|summary|ranking|anomaly|correlation|computed_metric|text_search|sentiment","datasets":["dataset name"],"columns":["col1","col2"],"operations":[{"function":"aggregate|filter|sort|topN|trend|compare|breakdown|anomaly|correlation|computeMetric|joinDatasets|summarize|searchText|extractThemes|sentimentScan","params":{}}],"chartType":"pie|bar|line|table|none","title":"Short title"}
+const PARSE_QUERY_SYSTEM = `You are a data analysis query planner. Given a user's question and available datasets, return ONLY valid JSON with this exact structure:
+{"intent":"summary|comparison|trend|ranking|breakdown|anomaly|correlation|computed_metric|text_search|sentiment","dataset":"dataset_id_or_name","metrics":["metric1"],"dimensions":["dimension1"],"analysis":["max|min|trend|comparison|breakdown|summary|anomaly|correlation|computed_metric|text_search|sentiment"]}
 
 Rules:
-- breakdown → use breakdown function with metricCol and groupCol; chartType: pie
-- comparison → use compare function with groupCol and metricCols array; chartType: bar
-- trend/change/why → use trend function with timeCol, metricCol, optional groupCol for driver analysis; chartType: line
-- ranking (top/bottom/highest/lowest) → use topN with metricCol, n, direction; chartType: bar
-- computed metrics (profit margin, cost per unit) → use computeMetric with formula object; chartType: bar
-- text_search → use searchText on customer_feedback dataset; chartType: table
-- sentiment → use sentimentScan on customer_feedback; chartType: pie
-- summary → use summarize with relevant columns; chartType: bar
-- anomaly → use anomaly with metricCol; chartType: table
-- ranking direction: "max", "maximum", "highest", "best", "most", "top" → direction:"top"; "min", "minimum", "lowest", "worst", "least", "bottom" → direction:"bottom". NEVER flip these.
-- For "last month" use the most recent time period in the data; for "this quarter" use Q4
-- For follow-up questions, use conversation context to fill in implicit dataset or columns`;
+- "analysis" can contain multiple values when the question asks for multiple conditions
+- "max and min", "highest and lowest", "top and bottom" MUST return analysis:["max","min"]
+- trend/change/over time → include "trend"
+- compare/vs/versus → include "comparison"
+- text search/find mention/keyword lookup → include "text_search"
+- happiness, satisfaction, feelings, feedback, complaints, reviews → MUST set intent:"sentiment", dataset:"customer_feedback", analysis:["sentiment"]
+- Sentiment queries MUST use text metrics only, never numeric metrics like revenue, cost, units, returns
+- Pick the best dataset for the query
+- Metrics should be measure columns; dimensions should be grouping/time/category columns
+- Use conversation context to fill in omitted dataset or columns when needed
+
+Examples:
+Q: max and min user signups
+{"intent":"ranking","dataset":"customer_behavior","metrics":["signups"],"dimensions":["week"],"analysis":["max","min"]}
+
+Q: Are customers happy?
+{"intent":"sentiment","dataset":"customer_feedback","metrics":["text"],"dimensions":["region"],"analysis":["sentiment"]}
+
+Q: revenue by region over time
+{"intent":"trend","dataset":"sales_performance","metrics":["revenue"],"dimensions":["month","region"],"analysis":["trend"]}
+`;
 
 /**
  * Parse a natural-language question into a structured analysis plan.
@@ -210,7 +307,7 @@ User question: "${question}"`;
   try {
     const raw = await _callGemini(prompt, PARSE_QUERY_SYSTEM);
     const json = JSON.parse(stripMarkdownFences(raw));
-    return _normalizePlan(json);
+    return _normalizePlan(_coerceSentimentPlan(json, question, registryMetadata), question);
   } catch (err) {
     console.warn("[geminiApi] parseQuery fell back to local:", err.message);
     return fallbackParseQuery(question, registryMetadata);
@@ -255,35 +352,87 @@ Rules:
  * @param {object[]} [metricDefinitions] — data-dictionary entries for context
  * @returns {Promise<string>}
  */
-export async function generateNarrative(analysisResults, question, metricDefinitions = []) {
+// export async function generateNarrative(analysisResults, question, metricDefinitions = []) {
+//   // Always use deterministic local narrative templates.
+//   // The Groq model (llama-3.1-8b-instant) frequently hallucinates error narratives
+//   // on valid results (e.g., claiming "column not found" when the analysis succeeded).
+//   // The local templates handle every result type reliably and are well-tested.
+//   // Groq is still used for parseQuery (query understanding) where it performs well.
+//   return fallbackNarrative(analysisResults, question);
+// }
+export async function generateNarrative(
+  analysisResults,
+  question,
+  metricDefinitions = []
+) {
+  // 🚫 If API unavailable → fallback
   if (!isApiAvailable() || !_reserveApiCall()) {
     return fallbackNarrative(analysisResults, question);
   }
 
-  // Build a safe, compact summary of results (no raw rows)
-  const { result, metadata } = analysisResults ?? {};
-  const resultSummary = _buildResultSummary(result, metadata);
-
-  const defsText = (metricDefinitions ?? [])
-    .map((d) => `${d.name}: ${d.def}`)
-    .join("; ");
-
-  const prompt = `User question: "${question}"
-Analysis method: ${metadata?.method ?? "unknown"}
-Columns analyzed: ${(metadata?.columnsUsed ?? []).join(", ")}
-Rows processed: ${metadata?.rowsAnalyzed ?? "unknown"}
-Metric definitions: ${defsText || "none provided"}
-
-Results summary:
-${resultSummary}
-
-Write the narrative:`;
+  // 🚫 If result has error → NEVER send to LLM
+  if (
+    !analysisResults ||
+    !analysisResults.result ||
+    (Array.isArray(analysisResults.result) &&
+      analysisResults.result[0]?.error)
+  ) {
+    return fallbackNarrative(analysisResults, question);
+  }
 
   try {
-    const text = await _callGemini(prompt, NARRATIVE_SYSTEM);
-    return text.trim();
+    // ✅ Build safe summary (already implemented by you)
+    const summary = _buildResultSummary(
+      analysisResults.result,
+      analysisResults.metadata
+    );
+
+    const prompt = `
+User Question:
+"${question}"
+
+Computed Results:
+${summary}
+
+Explain these results clearly.
+`;
+
+    const STRICT_NARRATIVE_SYSTEM = `
+You are a professional data analyst.
+
+You are given VERIFIED computed results from a system.
+These numbers are ALWAYS correct.
+
+Your job is ONLY to explain them clearly.
+
+STRICT RULES:
+- DO NOT invent any numbers
+- DO NOT assume missing data
+- ONLY use the numbers provided
+- If something is missing, say "Not available"
+- NEVER mention errors unless explicitly present in results
+- Keep it simple and natural
+
+FORMAT:
+
+✅ Final Answer
+(1–2 sentences, direct answer with numbers)
+
+📊 Key Insight
+(1–2 sentences explaining why)
+
+📁 Data Reference
+(List column names or fields used)
+
+⚠️ Notes
+(Assumptions or "None")
+`;
+
+    const raw = await _callGemini(prompt, STRICT_NARRATIVE_SYSTEM);
+
+    return raw;
   } catch (err) {
-    console.warn("[geminiApi] generateNarrative fell back to local:", err.message);
+    console.warn("[geminiApi] Narrative fell back to local:", err.message);
     return fallbackNarrative(analysisResults, question);
   }
 }
@@ -291,6 +440,40 @@ Write the narrative:`;
 /** Build a compact text summary of results to send to Gemini (no raw rows). */
 function _buildResultSummary(result, metadata) {
   if (!result) return "(no results)";
+
+  const isCombinedResult = (
+    result &&
+    !Array.isArray(result) &&
+    !result.counts &&
+    !result.groups &&
+    !result.topKeywords &&
+    Object.values(result).some((value) =>
+      Array.isArray(value) ||
+      (value && typeof value === "object" && (value.counts || value.groups || value.topKeywords))
+    )
+  );
+
+  if (isCombinedResult) {
+    return Object.entries(result).map(([key, value]) => {
+      if (Array.isArray(value) && value.length > 0) {
+        const first = value[0];
+        if (first && typeof first === "object") {
+          const metricKey = Object.keys(first).find((k) => typeof first[k] === "number" && !k.startsWith("_"));
+          const labelKey = Object.keys(first).find((k) => typeof first[k] === "string" && !k.startsWith("_"));
+          if (metricKey) {
+            const label = key.charAt(0).toUpperCase() + key.slice(1);
+            return `${label} ${metricKey}: ${first[metricKey]}${labelKey ? ` (${first[labelKey]})` : ""}`;
+          }
+        }
+        return `${key}: ${JSON.stringify(value[0])}`;
+      }
+      if (value?.counts) {
+        const c = value.counts;
+        return `${key}: Positive ${c.positive}, Negative ${c.negative}, Neutral ${c.neutral}, Total ${c.total}`;
+      }
+      return `${key}: ${JSON.stringify(value)}`;
+    }).join("\n");
+  }
 
   // sentimentScan — include groupRanking winner so Groq can name the specific group
   if (result?.counts) {
@@ -442,10 +625,51 @@ const INTENT_RULES = [
 /** Detect intent from the question using ordered keyword rules. Returns "summary" as default. */
 function _detectIntent(q) {
   const lower = q.toLowerCase();
+
+  // Pre-check: "weekly summary", "monthly overview" etc. → summary, not trend
+  // Without this, "weekly" matches trend patterns before "summary" gets a chance.
+  if (/\b(summar|overview|highlight|brief|update|insight|recap)\b/i.test(lower) &&
+      /\b(weekly|monthly|daily|quarterly)\b/i.test(lower)) {
+    return "summary";
+  }
+
+  if (_isSentimentQuery(lower)) {
+    return "sentiment";
+  }
+
   for (const { intent, patterns } of INTENT_RULES) {
     if (patterns.some((p) => p.test(lower))) return intent;
   }
   return "summary";
+}
+
+function _detectAnalysisTypes(question, intent) {
+  const lower = question.toLowerCase();
+  const analyses = [];
+  const hasMax = /\b(max|maximum|highest|top|best|most)\b/i.test(lower);
+  const hasMin = /\b(min|minimum|lowest|bottom|worst|least)\b/i.test(lower);
+
+  if (hasMax) analyses.push("max");
+  if (hasMin) analyses.push("min");
+  if (/\b(compare|vs\.?|versus|against|difference between)\b/i.test(lower) || intent === "comparison") {
+    analyses.push("comparison");
+  }
+  if (/\b(trend|over time|month over month|week over week|changed|change|increase|decrease|growth)\b/i.test(lower) || intent === "trend") {
+    analyses.push("trend");
+  }
+  if (intent === "sentiment" || _isSentimentQuery(lower)) analyses.push("sentiment");
+  if (intent === "text_search") analyses.push("text_search");
+  if (intent === "breakdown") analyses.push("breakdown");
+  if (intent === "anomaly") analyses.push("anomaly");
+  if (intent === "correlation") analyses.push("correlation");
+  if (intent === "computed_metric") analyses.push("computed_metric");
+
+  if (analyses.length === 0) {
+    if (intent === "ranking") analyses.push(hasMin && !hasMax ? "min" : "max");
+    else analyses.push(intent);
+  }
+
+  return [...new Set(analyses)];
 }
 
 /** Score each dataset by how many of its column names appear in the question. */
@@ -465,11 +689,11 @@ function _pickDataset(question, registryMetadata, intent) {
   if (!registryMetadata || registryMetadata.length === 0) return null;
 
   const lower = question.toLowerCase();
+  const feedbackDataset = _findFeedbackDataset(registryMetadata);
 
   // ── Force feedback dataset for text/sentiment intents ──
-  if (intent === "text_search" || intent === "sentiment") {
-    const fb = registryMetadata.find((d) => d.name.toLowerCase().includes("feedback"));
-    if (fb) return fb;
+  if (intent === "text_search" || intent === "sentiment" || _isSentimentQuery(lower)) {
+    if (feedbackDataset) return feedbackDataset;
   }
 
   // ── Domain keyword shortcuts (real dataset columns) ──
@@ -648,8 +872,8 @@ function _buildOperations(intent, question, dataset) {
         return [{ function: "rankColumns", params: { columns: quarterCols, direction: "top" } }];
       }
 
-      // Detect temporal comparison: "week by week", "month by month", "compare X over time"
-      const isTemporal = /week[- ]by[- ]week|month[- ]by[- ]month|over time|every (week|month)|per (week|month)|\bweekly\b|\bmonthly\b/i.test(lower);
+      // Detect temporal comparison: "week by week", "month by month", "compare X over time", "for all weeks", etc.
+      const isTemporal = /week[- ]by[- ]week|month[- ]by[- ]month|over time|every (week|month)|per (week|month)|\bweekly\b|\bmonthly\b|for all (week|month)|all weeks|all months|across (week|month)|each (week|month)|by week|by month/i.test(lower);
       if (isTemporal && timeCol) {
         return [{
           function: "trend",
@@ -661,15 +885,20 @@ function _buildOperations(intent, question, dataset) {
         }];
       }
 
-      // Detect specific period comparison: "Jan vs Feb", "W1 vs W2"
+      // Detect specific period comparison: "Jan vs Feb", "W1 vs W2", "this week vs last week"
       const vsMatch = lower.match(/(\w[\w\s]*?)\s+vs\.?\s+(\w[\w\s]*?)(?:\s|$)/i);
       if (vsMatch && timeCol) {
+        const periodA = vsMatch[1].trim();
+        const periodB = vsMatch[2].trim();
+        // Use compare operation grouped by time column, which gives per-period stats
+        // This handles "Jan vs Feb", "W1 vs W2" etc. by comparing across periods
         return [{
-          function: "trend",
+          function: "compare",
           params: {
-            timeCol: timeCol,
-            metricCol: requireCol(primaryMetric ?? numericCols[0], "metric"),
-            groupCol: null,
+            groupCol: timeCol,
+            metricCols: primaryMetric
+              ? [primaryMetric]
+              : numericCols.slice(0, 3),
           },
         }];
       }
@@ -870,24 +1099,34 @@ function _buildOperations(intent, question, dataset) {
 export function fallbackParseQuery(question, registryMetadata) {
   const intent = _detectIntent(question);
   const dataset = _pickDataset(question, registryMetadata, intent);
+  const analysis = _detectAnalysisTypes(question, intent);
 
   const mentioned = _findMentionedColumns(question, dataset);
   const numericCols = _colsOfType(dataset, "numeric");
   const catCols = _colsOfType(dataset, "categorical");
-  const primaryMetric = mentioned.find((c) => numericCols.includes(c)) ?? numericCols[0];
-  const primaryGroup = mentioned.find((c) => catCols.includes(c)) ?? catCols[0];
-  const usedColumns = [...new Set([primaryMetric, primaryGroup, ...mentioned].filter(Boolean))];
+  const dateCols = _colsOfType(dataset, "date");
+  const textCols = _colsOfType(dataset, "text");
+  const primaryMetric = mentioned.find((c) => numericCols.includes(c)) ?? numericCols[0] ?? textCols[0];
+  const primaryGroup = mentioned.find((c) => catCols.includes(c) || dateCols.includes(c)) ?? catCols[0] ?? dateCols[0];
+  const sentimentQuery = intent === "sentiment" || _isSentimentQuery(question);
+  const metrics = sentimentQuery
+    ? [textCols[0] ?? "text"]
+    : [...new Set([primaryMetric].filter(Boolean))];
+  const dimensions = [...new Set([primaryGroup].filter(Boolean))];
+  const effectiveIntent = sentimentQuery ? "sentiment" : intent;
 
-  const operations = _buildOperations(intent, question, dataset);
-
-  return _normalizePlan({
-    intent,
+  return _normalizePlan(_coerceSentimentPlan({
+    intent: effectiveIntent,
+    dataset: dataset?.id ?? dataset?.name ?? "",
+    metrics,
+    dimensions,
+    analysis,
     datasets: dataset ? [dataset.name] : [],
-    columns: usedColumns,
-    operations,
-    chartType: _chartForIntent(intent),
-    title: _makeTitle(intent, dataset, usedColumns),
-  });
+    columns: [...new Set([...metrics, ...dimensions])],
+    operations: [],
+    chartType: _chartForIntent(effectiveIntent),
+    title: _makeTitle(effectiveIntent, dataset, [...metrics, ...dimensions]),
+  }, question, registryMetadata), question);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -928,6 +1167,7 @@ export function fallbackNarrative(analysisResults, question) {
   const method = metadata?.method ?? "";
   const colsUsed = (metadata?.columnsUsed ?? []).join(", ") || "unknown fields";
   const rows = metadata?.rowsAnalyzed ?? "?";
+  const analysisKeys = metadata?.analysisKeys ?? [];
 
   if (!result) return _wrapStructured(
     "No results were returned for this query.",
@@ -941,6 +1181,22 @@ export function fallbackNarrative(analysisResults, question) {
       "The requested column or operation could not be completed.",
       colsUsed,
       "Check that the column name exists in the dataset."
+    );
+  }
+
+  if (
+    analysisKeys.length > 1 ||
+    (result &&
+      !Array.isArray(result) &&
+      !result.counts &&
+      !result.groups &&
+      Object.values(result).some((value) => Array.isArray(value) || (value && typeof value === "object")))
+  ) {
+    return _wrapStructured(
+      _buildResultSummary(result, metadata),
+      `Completed ${analysisKeys.length || Object.keys(result).length} analyses for the same query without dropping intermediate results.`,
+      colsUsed,
+      `Rows analyzed: ${rows}.`
     );
   }
 
@@ -1231,4 +1487,3 @@ export function fallbackNarrative(analysisResults, question) {
     colsUsed, "None."
   );
 }
-

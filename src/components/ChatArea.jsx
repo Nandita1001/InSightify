@@ -8,6 +8,8 @@ export default function ChatArea() {
     activeTab,
     displayMessages,
     uploadedFile,
+    uploadedDataType,
+    setUploadedDataType,
     setInput,
     fileRef,
     chatEndRef,
@@ -19,7 +21,7 @@ export default function ChatArea() {
 
   const onFileChange = (e) => {
     const file = e.target.files?.[0];
-    if (file) handleFileUpload(file);
+    if (file) handleFileUpload(file, uploadedDataType);
     e.target.value = "";
   };
 
@@ -40,18 +42,31 @@ export default function ChatArea() {
           onChange={onFileChange}
         />
 
-        {/* Upload zone */}
-        <div className="w-16 h-16 rounded-2xl flex items-center justify-center mb-5" style={{ background: "#f0f0ff" }}>
-          <Upload size={28} style={{ color: "#4f46e5" }} />
-        </div>
+        
+        
 
-        <h2 className="text-2xl font-bold mb-2" style={{ color: "#1a1a2e" }}>
-          Upload your dataset
-        </h2>
-        <p className="text-sm max-w-md text-center mb-8" style={{ color: "#9ca3af" }}>
-          Upload a CSV or Excel file and start asking questions about your own data —
-          with no restrictions and full access to every column.
-        </p>
+        
+       
+
+        <div className="w-80 mb-5 text-left">
+          <label
+            htmlFor="dataset-type"
+            className="block text-sm font-semibold mb-2"
+            style={{ color: "#1a1a2e" }}
+          >
+            Select Data Type
+          </label>
+          <select
+            id="dataset-type"
+            value={uploadedDataType}
+            onChange={(e) => setUploadedDataType(e.target.value)}
+            className="w-full rounded-xl border px-4 py-3 text-sm outline-none"
+            style={{ borderColor: "#d1d5db", background: "#fff", color: "#1a1a2e" }}
+          >
+            <option value="structured">Structured Data</option>
+            <option value="unstructured">Unstructured Data</option>
+          </select>
+        </div>
 
         <button
           onClick={() => fileRef.current?.click()}
@@ -75,7 +90,9 @@ export default function ChatArea() {
         </button>
 
         <p className="text-xs mt-6" style={{ color: "#c4c9d4" }}>
-          Your data stays local — nothing is sent to any server
+          {uploadedDataType === "unstructured"
+            ? "Unstructured queries send dataset text to Groq for answer generation"
+            : "Your data stays local, nothing is sent to any server"}
         </p>
       </div>
     );
@@ -107,7 +124,7 @@ export default function ChatArea() {
               {uploadedFile.name}
             </p>
             <p className="text-xs" style={{ color: "#6366f1" }}>
-              connected · no restrictions · full access
+              {uploadedDataType === "unstructured" ? "unstructured dataset" : "structured dataset"} · connected · no restrictions · full access
             </p>
           </div>
           <button
