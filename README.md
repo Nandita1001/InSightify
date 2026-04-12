@@ -59,7 +59,7 @@ The platform can be used by individuals (via personal data uploads) or by compan
 - Indicates whether response is AI-powered or deterministic
   
 ## Live Demo
-https://your-vercel-link.vercel.app
+(https://insightify-sigma.vercel.app/)
 
 ## Installation & Running the Project(Locally)
 
@@ -168,11 +168,49 @@ Users can switch to "My Data" mode and upload their own datasets. The platform a
 <img width="1363" height="681" alt="Screenshot 2026-04-12 224321" src="https://github.com/user-attachments/assets/df58d7e7-34d9-45fe-8f39-ffcbc29e2aa2" />
 InSightify also supports unstructured datasets such as logs or text data. Users can upload such data and ask natural language questions, with the system extracting relevant information and generating meaningful answers.
 
+## Architecture
 
+InSightify follows a hybrid architecture combining AI-based query understanding with a deterministic analytics engine.
 
+1. **Query Understanding (LLM)**
+   - Natural language queries are processed using Groq (llama-3.1-8b-instant)
+   - The system identifies intent (trend, comparison, summary, etc.)
 
+2. **Access Control Layer**
+   - Role-based and column-level permissions are validated
+   - Restricted queries trigger an access request workflow
 
+3. **Execution Engine**
+   - Structured data is processed using a deterministic analysis engine
+   - Unstructured data is handled using AI-based processing
 
+4. **Response Generation**
+   - Results are converted into human-readable insights
+   - Charts and visualizations are generated automatically
+
+5. **Explainability Layer**
+   - Displays datasets used, columns analyzed, and methods applied
+   - Ensures transparency and trust in results
+
+## Limitations
+
+- No authentication system (roles are manually selected for now)
+- Unstructured data analysis depends on LLM accuracy
+- Requires internet connection for AI-based queries
+- Conversation context is not maintained across the entire chat history
+
+## Future Improvements
+
+- Add user authentication and role management
+- Enhance NLP capabilities for more complex queries
+- Maintain full conversation context across chat history
+- Provide intelligent suggestions and recommendations based on previous queries(in "notes")
+
+## Deployment
+
+The project is deployed on Vercel:
+
+https://insightify-sigma.vercel.app/
 
 
 
