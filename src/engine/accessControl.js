@@ -90,32 +90,7 @@ for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
    §2  IN-MEMORY ACCESS REQUESTS STORE
 ═══════════════════════════════════════════════════════════ */
 
-let _requests = [
-  {
-    id: 1001,
-    from: "Marketing Team",
-    columns: ["cost", "ad_spend"],
-    reason: "Need cost data to calculate ROI for campaigns",
-    status: "pending",
-    timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000),
-  },
-  {
-    id: 1002,
-    from: "HR Team",
-    columns: ["revenue"],
-    reason: "Needed for executive compensation benchmarking",
-    status: "pending",
-    timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000),
-  },
-  {
-    id: 1003,
-    from: "Finance Team",
-    columns: ["nps"],
-    reason: "Required for quarterly business review dashboard",
-    status: "approved",
-    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000),
-  },
-];
+let _requests = [];
 
 let _nextId = 2000;
 
@@ -259,32 +234,7 @@ export function denyRequest(requestId) {
 
 /** Reset all requests and restriction indices to boot state. */
 export function resetRequests() {
-  _requests = [
-    {
-      id: 1001,
-      from: "Marketing Team",
-      columns: ["cost", "ad_spend"],
-      reason: "Need cost data to calculate ROI for campaigns",
-      status: "pending",
-      timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000),
-    },
-    {
-      id: 1002,
-      from: "HR Team",
-      columns: ["revenue"],
-      reason: "Needed for executive compensation benchmarking",
-      status: "pending",
-      timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000),
-    },
-    {
-      id: 1003,
-      from: "Finance Team",
-      columns: ["nps"],
-      reason: "Required for quarterly business review dashboard",
-      status: "approved",
-      timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000),
-    },
-  ];
+  _requests = [];
   _nextId = 2000;
 
   for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
