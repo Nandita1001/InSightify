@@ -1,34 +1,25 @@
 /**
- * accessControl.js — Role-Based Column-Level Access Control
+ * accessControl.js — Role-Based Column-Level Access Control (per-user approvals)
  *
- * Restrictions are based on the ACTUAL columns present in the 4 company datasets:
+ * Base restrictions come from ROLE_PERMISSIONS (role-level).
+ * Approvals are per-user: approving one HR Team member does NOT unlock columns
+ * for other HR Team members — each person needs their own approval.
  *
  *  Sales Performance:   month, region, product, channel, revenue, units, cost, returns, ad_spend
  *  Customer Behavior:   week, signups, churn, active_users, avg_handle_time, nps, tickets, resolution_rate, channel
  *  Financial Reports:   department, category, Q1, Q2, Q3, Q4, headcount
  *  Customer Feedback:   date, region, text
- *
- * Role philosophy:
- *  - Owner       → sees everything (no restrictions)
- *  - Finance Team → owns financials; blocked from raw text/PII, customer-support ops metrics
- *  - Marketing   → owns campaigns/acquisition; blocked from cost/budget internals, ops metrics
- *  - HR Team     → owns people data; blocked from customer metrics and financial detail
  */
 
+import { supabase } from "../lib/supabase.js";
+
 /* ═══════════════════════════════════════════════════════════
-   §1  ROLE PERMISSION DEFINITIONS
-   (based on actual dataset columns only)
+   §1  BASE ROLE PERMISSION DEFINITIONS  (never mutated)
 ═══════════════════════════════════════════════════════════ */
 
 const ROLE_PERMISSIONS = {
-  Owner: {
-    restricted: [],
-    canApprove: true,
-  },
+  Owner: { restricted: [], canApprove: true },
 
-  /* Finance Team — can see revenue, cost, ad_spend, Q1-Q4, headcount.
-     Blocked from: customer support ops (avg_handle_time, tickets, resolution_rate, nps)
-                   and raw qualitative text (PII / GDPR risk). */
   "Finance Team": {
     restricted: [
       { col: "text",            reason: "Raw customer feedback — PII / GDPR restricted" },
@@ -40,9 +31,6 @@ const ROLE_PERMISSIONS = {
     canApprove: false,
   },
 
-  /* Marketing Team — can see revenue, signups, churn, nps, channel, product, region.
-     Blocked from: internal cost breakdown, quarterly budget detail, headcount (confidential),
-                   support ops metrics (not marketing's purview). */
   "Marketing Team": {
     restricted: [
       { col: "cost",            reason: "Internal cost data — Finance confidential" },
@@ -58,217 +46,230 @@ const ROLE_PERMISSIONS = {
     canApprove: false,
   },
 
-  /* HR Team — can see headcount, department, signups, churn, active_users.
-     Blocked from: all financial figures (revenue, cost, ad_spend, Q1-Q4),
-                   customer experience scores, and raw feedback text (PII). */
   "HR Team": {
     restricted: [
-      { col: "revenue",   reason: "Financial data — Finance Team only" },
-      { col: "cost",      reason: "Financial data — Finance Team only" },
-      { col: "ad_spend",  reason: "Marketing budget — Finance/Marketing only" },
-      { col: "Q1",        reason: "Quarterly financials — Finance Team only" },
-      { col: "Q2",        reason: "Quarterly financials — Finance Team only" },
-      { col: "Q3",        reason: "Quarterly financials — Finance Team only" },
-      { col: "Q4",        reason: "Quarterly financials — Finance Team only" },
-      { col: "nps",       reason: "Customer experience KPI — Customer Success only" },
-      { col: "text",      reason: "Raw customer feedback — PII / GDPR restricted" },
-      { col: "returns",   reason: "Sales returns detail — Sales/Finance only" },
+      { col: "revenue",  reason: "Financial data — Finance Team only" },
+      { col: "cost",     reason: "Financial data — Finance Team only" },
+      { col: "ad_spend", reason: "Marketing budget — Finance/Marketing only" },
+      { col: "Q1",       reason: "Quarterly financials — Finance Team only" },
+      { col: "Q2",       reason: "Quarterly financials — Finance Team only" },
+      { col: "Q3",       reason: "Quarterly financials — Finance Team only" },
+      { col: "Q4",       reason: "Quarterly financials — Finance Team only" },
+      { col: "nps",      reason: "Customer experience KPI — Customer Success only" },
+      { col: "text",     reason: "Raw customer feedback — PII / GDPR restricted" },
+      { col: "returns",  reason: "Sales returns detail — Sales/Finance only" },
     ],
     canApprove: false,
   },
 };
 
-/* ─── Mutable restriction index per role: role → Map<lowercaseCol, reason> ─── */
-const _restrictionIndex = {};
-for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
-  _restrictionIndex[role] = new Map(
-    config.restricted.map(({ col, reason }) => [col.toLowerCase(), reason])
-  );
+/* ─── Build a fresh role-level restriction index ─── */
+function _buildIndex() {
+  const idx = {};
+  for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
+    idx[role] = new Map(
+      config.restricted.map(({ col, reason }) => [col.toLowerCase(), reason])
+    );
+  }
+  return idx;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   §2  IN-MEMORY ACCESS REQUESTS STORE
-═══════════════════════════════════════════════════════════ */
+/* Role-level restriction index — role → Map<lowercaseCol, reason> */
+const _restrictionIndex = _buildIndex();
 
-let _requests = [];
-
-let _nextId = 2000;
+/* Per-user approved columns — userId → Set<lowercaseCol> */
+const _userApprovals = new Map();
 
 /* ═══════════════════════════════════════════════════════════
-   §3  EXPORTED ACCESS CONTROL FUNCTIONS
+   §2  INDEX HELPERS  (called by AppContext after DB fetch)
 ═══════════════════════════════════════════════════════════ */
 
 /**
- * Check whether a role can access all of the required columns.
- * Respects dynamically granted access from approved requests.
+ * Populate _userApprovals from a list of fetched requests.
+ * Only approved requests with a user_id are applied.
+ * Role-level _restrictionIndex is NOT touched — restrictions stay role-wide;
+ * per-user grants live in _userApprovals.
  */
-export function checkAccess(role, requiredColumns) {
+export function applyApprovedRequests(requests) {
+  for (const req of requests) {
+    if (req.status !== "approved" || !req.user_id) continue;
+    if (!_userApprovals.has(req.user_id)) {
+      _userApprovals.set(req.user_id, new Set());
+    }
+    for (const col of (req.columns ?? [])) {
+      _userApprovals.get(req.user_id).add(col.toLowerCase());
+    }
+  }
+}
+
+/**
+ * Reset both the role-level restriction index and per-user approvals.
+ * Called before re-applying approved requests (keeps state consistent with DB).
+ * Also called on logout.
+ */
+export function resetRestrictionIndex() {
+  const fresh = _buildIndex();
+  for (const role of Object.keys(_restrictionIndex)) {
+    _restrictionIndex[role] = fresh[role];
+  }
+  for (const [role, map] of Object.entries(fresh)) {
+    if (!_restrictionIndex[role]) _restrictionIndex[role] = map;
+  }
+  _userApprovals.clear();
+}
+
+/* ═══════════════════════════════════════════════════════════
+   §3  SYNC ACCESS CONTROL  (reads in-memory state — no I/O)
+═══════════════════════════════════════════════════════════ */
+
+/**
+ * Check whether a user (identified by role + userId) can access all required columns.
+ * Columns the user has been individually approved for are not blocked.
+ */
+export function checkAccess(role, userId, requiredColumns) {
   if (role === "Owner" || !ROLE_PERMISSIONS[role]) {
     return { allowed: true, blockedColumns: [] };
   }
 
   const index = _restrictionIndex[role];
+  const granted = _userApprovals.get(userId) ?? new Set();
   const blocked = [];
 
   for (const col of (requiredColumns ?? [])) {
     const reason = index.get(col.toLowerCase());
-    if (reason !== undefined) {
+    if (reason !== undefined && !granted.has(col.toLowerCase())) {
       blocked.push({ col, reason });
     }
   }
 
-  return {
-    allowed: blocked.length === 0,
-    blockedColumns: blocked,
-  };
+  return { allowed: blocked.length === 0, blockedColumns: blocked };
 }
 
 /**
- * Return the CURRENT restricted column list for a role.
- * Reads from the live _restrictionIndex so approved grants are reflected immediately.
+ * Return the current restricted columns for a user.
+ * Columns the user has been approved for are excluded.
  */
-export function getRestrictions(role) {
+export function getRestrictions(role, userId) {
   if (role === "Owner" || !_restrictionIndex[role]) return [];
-  return Array.from(_restrictionIndex[role].entries()).map(([col, reason]) => ({
-    col: ROLE_PERMISSIONS[role]?.restricted.find(
-      (r) => r.col.toLowerCase() === col
-    )?.col ?? col,
-    reason,
-  }));
+  const granted = _userApprovals.get(userId) ?? new Set();
+  return Array.from(_restrictionIndex[role].entries())
+    .filter(([col]) => !granted.has(col))
+    .map(([col, reason]) => ({
+      col: ROLE_PERMISSIONS[role]?.restricted.find(
+        (r) => r.col.toLowerCase() === col
+      )?.col ?? col,
+      reason,
+    }));
 }
 
-/** Return all defined role names. */
 export function getRoles() {
   return Object.keys(ROLE_PERMISSIONS);
 }
 
-/** Return whether a role can approve access requests. */
 export function canApprove(role) {
   return ROLE_PERMISSIONS[role]?.canApprove ?? false;
 }
-
-/* ═══════════════════════════════════════════════════════════
-   §4  ACCESS REQUEST WORKFLOW
-═══════════════════════════════════════════════════════════ */
-
-/**
- * Create a new access request.
- * Deduplicates: returns existing pending request if same role+columns already pending.
- */
-export function createAccessRequest(fromRole, columns, reason = "") {
-  const normalizedCols = [].concat(columns).map((c) => c.toLowerCase()).sort();
-
-  const existing = _requests.find((r) => {
-    if (r.from !== fromRole || r.status !== "pending") return false;
-    const existing = r.columns.map((c) => c.toLowerCase()).sort();
-    return (
-      existing.length === normalizedCols.length &&
-      existing.every((c, i) => c === normalizedCols[i])
-    );
-  });
-
-  if (existing) return { ...existing };
-
-  const request = {
-    id: _nextId++,
-    from: fromRole,
-    columns: [].concat(columns),
-    reason,
-    status: "pending",
-    timestamp: new Date(),
-  };
-  _requests.push(request);
-  return { ...request };
-}
-
-/** Return all access requests (shallow copies), newest first. */
-export function getAccessRequests() {
-  return [..._requests]
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-    .map((r) => ({ ...r }));
-}
-
-/** Return only pending access requests. */
-export function getPendingRequests() {
-  return _requests.filter((r) => r.status === "pending").map((r) => ({ ...r }));
-}
-
-/**
- * Approve an access request by id.
- * Dynamically removes approved columns from the role's restriction index
- * and from ROLE_PERMISSIONS.restricted — so checkAccess() and getRestrictions()
- * immediately reflect the grant on the next call.
- */
-export function approveRequest(requestId) {
-  const req = _requests.find((r) => r.id === requestId);
-  if (!req) return null;
-
-  req.status = "approved";
-  req.resolvedAt = new Date();
-
-  const roleIndex = _restrictionIndex[req.from];
-  if (roleIndex) {
-    for (const col of req.columns) {
-      roleIndex.delete(col.toLowerCase());
-    }
-    const perms = ROLE_PERMISSIONS[req.from];
-    if (perms) {
-      const lowerApproved = req.columns.map((c) => c.toLowerCase());
-      perms.restricted = perms.restricted.filter(
-        (r) => !lowerApproved.includes(r.col.toLowerCase())
-      );
-    }
-  }
-
-  return { ...req };
-}
-
-/** Deny an access request by id. */
-export function denyRequest(requestId) {
-  const req = _requests.find((r) => r.id === requestId);
-  if (!req) return null;
-  req.status = "denied";
-  req.resolvedAt = new Date();
-  return { ...req };
-}
-
-/** Reset all requests and restriction indices to boot state. */
-export function resetRequests() {
-  _requests = [];
-  _nextId = 2000;
-
-  for (const [role, config] of Object.entries(ROLE_PERMISSIONS)) {
-    _restrictionIndex[role] = new Map(
-      config.restricted.map(({ col, reason }) => [col.toLowerCase(), reason])
-    );
-  }
-}
-
-/* ═══════════════════════════════════════════════════════════
-   §5  INTROSPECTION HELPERS
-═══════════════════════════════════════════════════════════ */
 
 export function getAllPermissions() {
   return JSON.parse(JSON.stringify(ROLE_PERMISSIONS));
 }
 
-export function partitionColumns(role, datasetColumns) {
+export function partitionColumns(role, userId, datasetColumns) {
   if (role === "Owner" || !ROLE_PERMISSIONS[role]) {
     return { allowed: datasetColumns, blocked: [] };
   }
-
   const index = _restrictionIndex[role];
-  const allowed = [];
-  const blocked = [];
-
+  const granted = _userApprovals.get(userId) ?? new Set();
+  const allowed = [], blocked = [];
   for (const col of datasetColumns) {
     const reason = index.get(col.toLowerCase());
-    if (reason !== undefined) {
+    if (reason !== undefined && !granted.has(col.toLowerCase())) {
       blocked.push({ col, reason });
     } else {
       allowed.push(col);
     }
   }
-
   return { allowed, blocked };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   §4  ASYNC ACCESS REQUEST WORKFLOW  (Supabase-backed)
+═══════════════════════════════════════════════════════════ */
+
+/** Fetch all access requests, newest first. */
+export async function getAccessRequests() {
+  const { data, error } = await supabase
+    .from("access_requests")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return data ?? [];
+}
+
+/**
+ * Create an access request for a specific user.
+ * Deduplicates: returns the existing pending request if same user + columns already pending.
+ */
+export async function createAccessRequest(fromRole, userId, userName, columns, reason = "") {
+  const cols = [].concat(columns);
+  const normalizedCols = cols.map((c) => c.toLowerCase()).sort();
+
+  // Check for a duplicate pending request from this exact user + columns
+  const { data: existing } = await supabase
+    .from("access_requests")
+    .select("*")
+    .eq("from_role", fromRole)
+    .eq("user_id", userId)
+    .eq("status", "pending");
+
+  if (existing) {
+    const dup = existing.find((req) => {
+      const reqCols = (req.columns ?? []).map((c) => c.toLowerCase()).sort();
+      return (
+        reqCols.length === normalizedCols.length &&
+        reqCols.every((c, i) => c === normalizedCols[i])
+      );
+    });
+    if (dup) return { ...dup };
+  }
+
+  const { data, error } = await supabase
+    .from("access_requests")
+    .insert({
+      from_role: fromRole,
+      user_id: userId,
+      user_name: userName,
+      columns: cols,
+      reason,
+      status: "pending",
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+/** Approve an access request. Restriction index is updated by AppContext via fetchAccessRequests(). */
+export async function approveRequest(requestId) {
+  const { data, error } = await supabase
+    .from("access_requests")
+    .update({ status: "approved", resolved_at: new Date().toISOString() })
+    .eq("id", requestId)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/** Deny an access request. */
+export async function denyRequest(requestId) {
+  const { data, error } = await supabase
+    .from("access_requests")
+    .update({ status: "denied", resolved_at: new Date().toISOString() })
+    .eq("id", requestId)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
 }

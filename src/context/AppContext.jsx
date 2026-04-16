@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useRef } from "react";
+import { createContext, useContext, useState, useEffect, useRef, useCallback } from "react";
 import {
   processQuery,
   getSuggestedQuestions,
@@ -10,15 +10,23 @@ import {
   getRestrictions,
   getRoles,
   getAccessRequests,
-  getPendingRequests,
   approveRequest,
   denyRequest,
   createAccessRequest,
+  applyApprovedRequests,
+  resetRestrictionIndex,
 } from "../engine/accessControl.js";
+import { supabase } from "../lib/supabase.js";
 
 const AppContext = createContext(null);
 
 export function AppProvider({ children }) {
+  /* ── Auth ── */
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authView, setAuthView] = useState("login"); // "login" | "signup"
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+
   /* ── Tab & Role ── */
   const [activeTab, setActiveTab]       = useState("company");
   const [role, setRole]                 = useState("Owner");
@@ -36,14 +44,14 @@ export function AppProvider({ children }) {
   /* ── Trust expand ── */
   const [expandedTrust, setExpandedTrust] = useState(null);
 
-  /* ── Access requests from engine (synced via local state so UI re-renders) ── */
-  const [accessRequests, setAccessRequests] = useState(() => getAccessRequests());
+  /* ── Access requests (Supabase-backed) ── */
+  const [accessRequests, setAccessRequests] = useState([]);
 
   /* ── Toast notification ── */
   const [notification, setNotification] = useState(null);
 
   /* ── Upload state ── */
-  const [uploadedFile, setUploadedFile]         = useState(null);   // File object
+  const [uploadedFile, setUploadedFile]         = useState(null);
   const [uploadedDatasetId, setUploadedDatasetId] = useState(null);
   const [uploadedDataType, setUploadedDataType] = useState("structured");
 
@@ -51,7 +59,6 @@ export function AppProvider({ children }) {
   const [isLoading, setIsLoading]       = useState(false);
 
   /* ── Per-role, per-tab chat storage ── */
-  // chats are stored separately for company tab and upload tab.
   const [companyChats, setCompanyChats] = useState(() => {
     const initial = {};
     for (const r of getRoles()) {
@@ -63,24 +70,19 @@ export function AppProvider({ children }) {
     return initial;
   });
 
-  // Upload tab gets a single flat chat (no sidebar history needed)
   const [uploadChat, setUploadChat] = useState({ messages: [] });
 
   /* ── Derived chat values ── */
   const isUploadTab    = activeTab === "upload";
-
-  // Company-tab derived values
   const roleChats      = companyChats[role]?.chats ?? [];
   const activeChatId   = companyChats[role]?.activeChatId ?? roleChats[0]?.id;
   const activeChat     = roleChats.find((c) => c.id === activeChatId) ?? roleChats[0];
-
-  // Active messages depend on which tab we're in
   const currentMessages = isUploadTab ? uploadChat.messages : (activeChat?.messages ?? []);
   const displayMessages = currentMessages;
 
   /* ── Derived engine values ── */
-  const restrictions     = getRestrictions(role);   // from accessControl engine
-  const pendingCount     = accessRequests.filter((r) => r.status === "pending").length;
+  const restrictions       = getRestrictions(role, currentUser?.id);
+  const pendingCount       = accessRequests.filter((r) => r.status === "pending").length;
   const suggestedQuestions = getSuggestedQuestions(activeTab, uploadedDatasetId, role);
   const dataDictionary     = getDataDictionary(activeTab, uploadedDatasetId);
   const registryInfo       = getRegistryInfo();
@@ -94,6 +96,19 @@ export function AppProvider({ children }) {
   const registryRef = useRef(null);
   const dictRef     = useRef(null);
   const restrictRef = useRef(null);
+
+  /* ── Fetch access requests from Supabase + sync restriction index ── */
+  const fetchAccessRequests = useCallback(async () => {
+    try {
+      const requests = await getAccessRequests();
+      // Rebuild restriction index from scratch then apply approved grants
+      resetRestrictionIndex();
+      applyApprovedRequests(requests);
+      setAccessRequests(requests);
+    } catch (err) {
+      console.error("Failed to fetch access requests:", err);
+    }
+  }, []);
 
   /* ── Auto-scroll ── */
   useEffect(() => {
@@ -113,6 +128,128 @@ export function AppProvider({ children }) {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  /* ── Build user object: reads role from profiles table (editable in Supabase dashboard),
+        falls back to user_metadata if the profile row doesn't exist yet ── */
+  const buildUser = useCallback(async (session) => {
+    const meta = session.user.user_metadata;
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("name, role")
+      .eq("id", session.user.id)
+      .single();
+    return {
+      id:    session.user.id,
+      email: session.user.email,
+      name:  profile?.name  ?? meta?.name  ?? session.user.email,
+      role:  profile?.role  ?? meta?.role  ?? "Owner",
+    };
+  }, []);
+
+  /* ── Supabase auth: restore session on mount + listen for auth state changes ── */
+  useEffect(() => {
+    let mounted = true;
+
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (!mounted) return;
+      if (session) {
+        const u = await buildUser(session);
+        if (!mounted) return;
+        setCurrentUser(u);
+        setRole(u.role);
+        setIsAuthenticated(true);
+      }
+      setIsAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+      if (session) {
+        buildUser(session).then((u) => {
+          if (!mounted) return;
+          setCurrentUser(u);
+          setRole(u.role);
+          setIsAuthenticated(true);
+        });
+      } else {
+        setCurrentUser(null);
+        setIsAuthenticated(false);
+        setRole("Owner");
+      }
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ── Real-time access requests: fetch on login + subscribe for live updates ── */
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    // Initial load
+    fetchAccessRequests();
+
+    // Subscribe to all changes on the access_requests table
+    const channel = supabase
+      .channel("access_requests_realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "access_requests" },
+        () => { fetchAccessRequests(); }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [isAuthenticated, fetchAccessRequests]);
+
+  /* ── Auth functions ── */
+  const login = async (email, password) => {
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) return { success: false, message: error.message };
+      return { success: true };
+    } catch {
+      return { success: false, message: "Something went wrong. Please try again." };
+    }
+  };
+
+  const signup = async (name, email, password, selectedRole) => {
+    try {
+      const { error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { name, role: selectedRole } },
+      });
+      if (error) return { success: false, message: error.message };
+      return { success: true, needsOtp: true };
+    } catch {
+      return { success: false, message: "Something went wrong. Please try again." };
+    }
+  };
+
+  const verifyOtp = async (email, token) => {
+    try {
+      const { error } = await supabase.auth.verifyOtp({ email, token, type: "signup" });
+      if (error) return { success: false, message: error.message };
+      return { success: true };
+    } catch {
+      return { success: false, message: "Something went wrong. Please try again." };
+    }
+  };
+
+  const logout = async () => {
+    await supabase.auth.signOut();
+    resetRestrictionIndex();
+    setAccessRequests([]);
+    setCurrentUser(null);
+    setIsAuthenticated(false);
+    setRole("Owner");
+    setAuthView("login");
+  };
+
   /* ── Toast ── */
   const showNotif = (msg) => {
     setNotification(msg);
@@ -122,10 +259,8 @@ export function AppProvider({ children }) {
   /* ── Push a message into the current active chat (tab-aware) ── */
   const pushMessage = (msg) => {
     if (activeTab === "upload") {
-      // Upload tab: single flat chat
       setUploadChat((prev) => ({ messages: [...prev.messages, msg] }));
     } else {
-      // Company tab: per-role, per-chat
       setCompanyChats((prev) => {
         const roleData = { ...prev[role] };
         roleData.chats = roleData.chats.map((c) => {
@@ -142,10 +277,9 @@ export function AppProvider({ children }) {
     }
   };
 
-  /* ── New Chat (company tab only) ── */
+  /* ── New Chat ── */
   const handleNewChat = () => {
     if (activeTab === "upload") {
-      // In upload tab, "new chat" means clear messages and remove the uploaded file
       setUploadChat({ messages: [] });
       if (uploadedDatasetId) removeDataset(uploadedDatasetId);
       setUploadedFile(null);
@@ -167,7 +301,7 @@ export function AppProvider({ children }) {
     setExpandedTrust(null);
   };
 
-  /* ── Switch Chat (company tab only) ── */
+  /* ── Switch Chat ── */
   const switchChat = (chatId) => {
     setCompanyChats((prev) => ({
       ...prev,
@@ -176,16 +310,21 @@ export function AppProvider({ children }) {
     setExpandedTrust(null);
   };
 
-  /* ── Approve / Deny access request (engine + local state sync) ── */
-  const handleAccess = (id, approved) => {
-    if (approved) {
-      approveRequest(id);
-    } else {
-      denyRequest(id);
+  /* ── Approve / Deny access request ── */
+  const handleAccess = async (id, approved) => {
+    try {
+      if (approved) {
+        await approveRequest(id);
+      } else {
+        await denyRequest(id);
+      }
+      // fetchAccessRequests will also be triggered by real-time subscription,
+      // but call it here too so the UI updates immediately for the Owner.
+      await fetchAccessRequests();
+      showNotif(approved ? "Access approved successfully" : "Access request denied");
+    } catch {
+      showNotif("Failed to process request. Please try again.");
     }
-    // Sync access requests AND restrictions from engine (approval mutates both)
-    setAccessRequests(getAccessRequests());
-    showNotif(approved ? "Access approved successfully" : "Access request denied");
   };
 
   /* ── Send question through engine ── */
@@ -201,7 +340,6 @@ export function AppProvider({ children }) {
     setInput("");
     setIsLoading(true);
 
-    // Build conversation context snapshot from the correct chat (last 5 messages)
     const ctxMessages = isUploadTab ? uploadChat.messages : (activeChat?.messages ?? []);
     const context = ctxMessages.slice(-5).map((m) => ({
       role: m.role,
@@ -209,7 +347,7 @@ export function AppProvider({ children }) {
     }));
 
     try {
-      const result = await processQuery(text, role, context, activeTab, uploadedDatasetId);
+      const result = await processQuery(text, role, context, activeTab, uploadedDatasetId, currentUser);
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
       if (result.type === "blocked") {
@@ -242,7 +380,6 @@ export function AppProvider({ children }) {
           time,
         });
       } else {
-        // success
         pushMessage({
           role: "assistant",
           content: result.narrative,
@@ -254,10 +391,10 @@ export function AppProvider({ children }) {
           time,
         });
       }
-    } catch (err) {
+    } catch {
       pushMessage({
         role: "assistant",
-        content: `Something went wrong while analyzing your data. Please try rephrasing your question.`,
+        content: "Something went wrong while analyzing your data. Please try rephrasing your question.",
         isError: true,
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       });
@@ -270,12 +407,9 @@ export function AppProvider({ children }) {
   const handleFileUpload = async (file, datasetType = "structured") => {
     if (!file) return;
     setIsLoading(true);
-
-    // Reset upload chat so it starts fresh with the new dataset
     setUploadChat({ messages: [] });
 
     try {
-      // Remove old upload from registry
       if (uploadedDatasetId) removeDataset(uploadedDatasetId);
 
       const entry = await registerCSV(file, {
@@ -286,14 +420,12 @@ export function AppProvider({ children }) {
       setUploadedDatasetId(entry.id);
       setUploadedDataType(entry.type);
 
-      // Build column summary narrative
       const colLines = entry.columns
         .slice(0, 12)
         .map((c) => `• **${c.name}** (${c.type})${c.description ? ": " + c.description : ""}`)
         .join("\n");
       const extra = entry.columns.length > 12 ? `\n• …and ${entry.columns.length - 12} more columns` : "";
 
-      // Push welcome message directly into upload chat
       setUploadChat({
         messages: [{
           role: "assistant",
@@ -301,7 +433,7 @@ export function AppProvider({ children }) {
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         }]
       });
-    } catch (err) {
+    } catch {
       setUploadChat({
         messages: [{
           role: "assistant",
@@ -316,15 +448,22 @@ export function AppProvider({ children }) {
   };
 
   /* ── Request access (from AccessBlockedMsg) ── */
-  const handleRequestAccess = (columns) => {
-    createAccessRequest(role, columns, "Requested via query");
-    setAccessRequests(getAccessRequests());
-    showNotif("Access request sent to data owner");
+  const handleRequestAccess = async (columns) => {
+    try {
+      await createAccessRequest(role, currentUser?.id, currentUser?.name, columns, "Requested via query");
+      await fetchAccessRequests();
+      showNotif("Access request sent to data owner");
+    } catch {
+      showNotif("Failed to send access request. Please try again.");
+    }
   };
 
   return (
     <AppContext.Provider
       value={{
+        // Auth
+        isAuthenticated, isAuthLoading, currentUser, authView, setAuthView,
+        login, signup, verifyOtp, logout,
         // Tab
         activeTab, setActiveTab,
         // Role

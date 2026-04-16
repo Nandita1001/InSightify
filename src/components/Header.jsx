@@ -1,6 +1,6 @@
 import {
-  Database, ChevronDown, Shield, Users, FileText, BarChart3,
-  Bell, X, CheckCircle, XCircle, Clock,
+  Database, Shield, Users, FileText, BarChart3,
+  Bell, X, CheckCircle, XCircle, Clock, LogOut,
 } from "lucide-react";
 import { useApp } from "../context/AppContext";
 
@@ -13,13 +13,16 @@ const ROLE_ICONS = {
 
 export default function Header() {
   const {
-    role, setRole, roleOpen, setRoleOpen, roles,
+    role, currentUser, logout,
     bellOpen, setBellOpen,
     pendingCount, accessRequests, handleAccess,
-    roleRef, bellRef,
+    bellRef,
   } = useApp();
 
   const RoleIcon = ROLE_ICONS[role] ?? Users;
+  const initials = currentUser?.name
+    ? currentUser.name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase()
+    : "?";
 
   return (
     <header
@@ -48,49 +51,26 @@ export default function Header() {
       </div>
 
       <div className="flex items-center gap-3">
-        {/* Role Switcher */}
-        <div className="relative" ref={roleRef}>
-          <button
-            onClick={() => setRoleOpen(!roleOpen)}
-            className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl border text-sm font-semibold transition-all"
-            style={{ background: "#fff", borderColor: roleOpen ? "#4f46e5" : "#e8eaed", color: "#1a1a2e" }}
+        {/* User info pill */}
+        <div
+          className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl border"
+          style={{ background: "#fff", borderColor: "#e8eaed" }}
+        >
+          <div
+            className="w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
+            style={{ background: "linear-gradient(135deg, #4f46e5, #7c3aed)" }}
           >
-            <RoleIcon size={16} style={{ color: "#4f46e5" }} />
-            {role}
-            <ChevronDown
-              size={15}
-              style={{
-                color: "#9ca3af",
-                transform: roleOpen ? "rotate(180deg)" : "none",
-                transition: "transform 0.2s",
-              }}
-            />
-          </button>
-
-          {roleOpen && (
-            <div
-              className="absolute right-0 top-full mt-2 w-52 rounded-xl border shadow-2xl z-50 overflow-hidden dropdown-enter"
-              style={{ background: "#fff", borderColor: "#e8eaed" }}
-            >
-              {roles.map((r) => {
-                const Icon = ROLE_ICONS[r] ?? Users;
-                return (
-                  <button
-                    key={r}
-                    onClick={() => { setRole(r); setRoleOpen(false); setBellOpen(false); }}
-                    className="w-full text-left px-4 py-3 text-sm font-medium flex items-center gap-3 transition-colors hover:bg-gray-50"
-                    style={{
-                      background: r === role ? "#f0f0ff" : "#fff",
-                      color: r === role ? "#4f46e5" : "#1a1a2e",
-                    }}
-                  >
-                    <Icon size={15} />
-                    {r}
-                  </button>
-                );
-              })}
+            {initials}
+          </div>
+          <div className="leading-tight">
+            <p className="text-sm font-semibold" style={{ color: "#1a1a2e" }}>
+              {currentUser?.name ?? "User"}
+            </p>
+            <div className="flex items-center gap-1">
+              <RoleIcon size={10} style={{ color: "#4f46e5" }} />
+              <p className="text-[11px] font-medium" style={{ color: "#4f46e5" }}>{role}</p>
             </div>
-          )}
+          </div>
         </div>
 
         {/* Bell — Owner only */}
@@ -155,16 +135,19 @@ export default function Header() {
                         <div className="flex items-center justify-between mb-1.5">
                           <div>
                             <p className="font-semibold text-sm" style={{ color: "#1a1a2e" }}>
-                              {req.from}
+                              {req.user_name ?? req.from_role}
+                            </p>
+                            <p className="text-[11px] font-medium" style={{ color: "#4f46e5" }}>
+                              {req.from_role}
                             </p>
                             <p
                               className="text-[11px] flex items-center gap-1 mt-0.5"
                               style={{ color: "#9ca3af" }}
                             >
                               <Clock size={10} />
-                              {req.timestamp
-                                ? new Date(req.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-                                : req.time ?? "just now"}
+                              {req.created_at
+                                ? new Date(req.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                                : "just now"}
                             </p>
                           </div>
 
@@ -224,6 +207,16 @@ export default function Header() {
             )}
           </div>
         )}
+
+        {/* Sign out */}
+        <button
+          onClick={logout}
+          className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border text-sm font-medium transition-colors hover:bg-gray-50"
+          style={{ background: "#fff", borderColor: "#e8eaed", color: "#6b7280" }}
+        >
+          <LogOut size={15} />
+          Sign out
+        </button>
       </div>
     </header>
   );

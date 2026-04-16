@@ -5,9 +5,29 @@ import TabBar from "./components/TabBar";
 import ChatSidebar from "./components/ChatSidebar";
 import ChatArea from "./components/ChatArea";
 import ChatInput from "./components/ChatInput";
+import LoginPage from "./components/LoginPage";
+import SignupPage from "./components/SignupPage";
 
 function AppContent() {
-  const { notification } = useApp();
+  const { notification, isAuthenticated, isAuthLoading, authView } = useApp();
+
+  if (isAuthLoading) {
+    return (
+      <div
+        className="min-h-screen flex items-center justify-center"
+        style={{ background: "#f8f9fb" }}
+      >
+        <div
+          className="w-9 h-9 rounded-full border-[3px] border-t-transparent animate-spin"
+          style={{ borderColor: "#4f46e5", borderTopColor: "transparent" }}
+        />
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return authView === "signup" ? <SignupPage /> : <LoginPage />;
+  }
 
   return (
     <div className="h-screen flex flex-col overflow-hidden" style={{ background: "#f8f9fb", fontFamily: "'Plus Jakarta Sans', sans-serif", color: "#1a1a2e" }}>

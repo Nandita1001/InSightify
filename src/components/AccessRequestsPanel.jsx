@@ -14,8 +14,12 @@ export default function AccessRequestsPanel() {
             <div key={req.id} className="p-3 rounded-xl border" style={{ borderColor: "#e8eaed", background: "#fafbfc" }}>
               <div className="flex items-center justify-between mb-1.5">
                 <div>
-                  <p className="font-semibold text-sm" style={{ color: "#1a1a2e" }}>{req.from}</p>
-                  <p className="text-[11px] flex items-center gap-1 mt-0.5" style={{ color: "#9ca3af" }}><Clock size={10} /> {req.time}</p>
+                  <p className="font-semibold text-sm" style={{ color: "#1a1a2e" }}>{req.user_name ?? req.from_role}</p>
+                  <p className="text-[11px] font-medium" style={{ color: "#4f46e5" }}>{req.from_role}</p>
+                  <p className="text-[11px] flex items-center gap-1 mt-0.5" style={{ color: "#9ca3af" }}>
+                    <Clock size={10} />
+                    {req.created_at ? new Date(req.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "just now"}
+                  </p>
                 </div>
                 {req.status === "pending" ? (
                   <div className="flex gap-1.5">

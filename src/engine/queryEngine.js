@@ -40,9 +40,6 @@ import {
 import {
   checkAccess,
   getRestrictions,
-  createAccessRequest,
-  getAccessRequests,
-  getPendingRequests,
 } from "./accessControl.js";
 
 /* ── Gemini API + fallbacks ── */
@@ -582,7 +579,8 @@ export async function processQuery(
   role,
   conversationContext,
   activeTab,
-  uploadedDatasetId
+  uploadedDatasetId,
+  user = {}
 ) {
   try {
     /* ── Step 1: Build available datasets ── */
@@ -754,20 +752,14 @@ export async function processQuery(
     }
 
     /* ── Step 5: Access control — MUST run before any data processing ── */
-    const accessResult = checkAccess(role, Array.from(allRequiredColumns));
+    const accessResult = checkAccess(role, user.id, Array.from(allRequiredColumns));
 
     if (!accessResult.allowed) {
-      const accessRequest = createAccessRequest(
-        role,
-        accessResult.blockedColumns.map((c) => c.col),
-        `Auto-generated from query: ${question}`
-      );
       return {
         type: "blocked",
-        blockedColumns: accessResult.blockedColumns, // [{ col, reason }]
+        blockedColumns: accessResult.blockedColumns,
         role,
-        accessRequest,
-        restrictions: getRestrictions(role),
+        restrictions: getRestrictions(role, user.id),
       };
     }
 
