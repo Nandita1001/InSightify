@@ -1,20 +1,25 @@
 /**
- * geminiApi.js — Gemini API Integration + Local Fallback
+ * geminiApi.js — LLM client (proxies through Insightify backend) + local fallback.
+ *
+ * Groq is called by the backend at /api/llm/*. The frontend only submits
+ * structured inputs (question, registry metadata, analysis results) — it never
+ * sees the Groq API key or the prompt templates.
  *
  * Functions:
  *   parseQuery(question, registryMetadata, conversationContext) → analysis plan JSON
  *   generateNarrative(analysisResults, question, metricDefinitions) → narrative string
  *   fallbackParseQuery(question, registryMetadata) → analysis plan (no API needed)
  *   fallbackNarrative(analysisResults, question) → template-based narrative
- *   isApiAvailable() → boolean
+ *   isApiAvailable() → boolean (tracks last backend call outcome)
  *
  * Rules:
- *  - Never send raw data rows to Gemini — only column names + aggregated numbers.
- *  - All API calls wrapped in try/catch — always fall back gracefully.
- *  - Simple rate limiter: skip API and use fallback after 14 calls / 60 s.
- *  - Strip markdown fences from Gemini responses before JSON.parse.
+ *  - Never send raw data rows — only column names + aggregated numbers.
+ *  - All backend calls wrapped in try/catch — always fall back gracefully.
+ *  - Simple client-side rate limiter: skip API after 14 calls / 60 s.
+ *  - Strip markdown fences from LLM responses before JSON.parse.
  */
 import { formatNumber, formatPercent } from "./analysisOps.js";
+import { llmApi } from "../lib/api.js";
 
 /* ═══════════════════════════════════════════════════════════
    §0  CONSTANTS & RATE LIMITER
@@ -68,42 +73,11 @@ function stripMarkdownFences(text) {
 }
 
 /**
- * Low-level Groq POST — uses proper system/user message roles.
- * @param {string} prompt     — user prompt text
- * @param {string} [system]   — optional system prompt (sent as role:"system")
+ * Tracks whether the backend LLM is currently reachable.
+ * Flipped by successful/failed parseQuery + generateNarrative calls, read by
+ * isApiAvailable() so the UI's "AI-powered" badge reflects reality.
  */
-async function _callGemini(prompt, system = null) {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
-
-  const messages = [];
-  if (system) messages.push({ role: "system", content: system });
-  messages.push({ role: "user", content: prompt });
-
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "llama-3.1-8b-instant",
-      messages,
-      temperature: 0.1,
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => response.statusText);
-    // On 429 rate-limit, throw with specific message so callers can handle
-    throw new Error(`Groq API ${response.status}: ${errText}`);
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content;
-
-  if (!text) throw new Error("Groq returned empty response.");
-  return text;
-}
+let _apiHealthy = true;
 
 
 /** Validate and coerce an analysis plan object so consumers never crash. */
@@ -167,28 +141,6 @@ function _normalizePlan(raw, question = "") {
   };
 }
 
-/** Format registry metadata into a readable text block for prompts. */
-function _buildRegistryText(registryMetadata) {
-  return (registryMetadata ?? [])
-    .map((ds) => {
-      const cols = (ds.columns ?? [])
-        .map((c) => `    - ${c.name} (${c.type})${c.description ? ": " + c.description : ""}`)
-        .join("\n");
-      return `Dataset: "${ds.name}"\nDescription: ${ds.description}\nColumns:\n${cols}`;
-    })
-    .join("\n\n");
-}
-
-/** Format conversation context for the prompt. */
-function _buildContextText(conversationContext) {
-  if (!conversationContext || conversationContext.length === 0)
-    return "(no prior conversation)";
-  return conversationContext
-    .slice(-3)
-    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${String(m.content).slice(0, 200)}`)
-    .join("\n");
-}
-
 function _isSentimentQuery(question = "") {
   return /\bhappy\b|\bhappiness\b|\bsatisfied?\b|\bsatisfaction\b|\bfeel(?:ing|ings)?\b|\bfeedback\b|\bcomplaints?\b|\breviews?\b|\bunhappy\b|\bdissatisfied\b|\bsentiment\b/i.test(question);
 }
@@ -241,198 +193,88 @@ function _coerceSentimentPlan(plan, question, registryMetadata) {
 ═══════════════════════════════════════════════════════════ */
 
 /**
- * Returns true if the Gemini API key is configured.
- * Use to show "AI-powered" vs "Local analysis" indicator in the UI.
+ * Returns true if the backend LLM has answered successfully recently.
+ * Used by the trust panel to label results "AI-powered" vs "Local analysis".
  */
 export function isApiAvailable() {
-  const key = import.meta.env.VITE_GROQ_API_KEY;
-  return typeof key === "string" && key.trim().length > 10;
+  return _apiHealthy;
 }
 
 /* ═══════════════════════════════════════════════════════════
-   §3  parseQuery
+   §3  parseQuery  (calls backend /api/llm/parse)
 ═══════════════════════════════════════════════════════════ */
-
-const PARSE_QUERY_SYSTEM = `You are a data analysis query planner. Given a user's question and available datasets, return ONLY valid JSON with this exact structure:
-{"intent":"summary|comparison|trend|ranking|breakdown|anomaly|correlation|computed_metric|text_search|sentiment","dataset":"dataset_id_or_name","metrics":["metric1"],"dimensions":["dimension1"],"analysis":["max|min|trend|comparison|breakdown|summary|anomaly|correlation|computed_metric|text_search|sentiment"]}
-
-Rules:
-- "analysis" can contain multiple values when the question asks for multiple conditions
-- "max and min", "highest and lowest", "top and bottom" MUST return analysis:["max","min"]
-- trend/change/over time → include "trend"
-- compare/vs/versus → include "comparison"
-- text search/find mention/keyword lookup → include "text_search"
-- happiness, satisfaction, feelings, feedback, complaints, reviews → MUST set intent:"sentiment", dataset:"customer_feedback", analysis:["sentiment"]
-- Sentiment queries MUST use text metrics only, never numeric metrics like revenue, cost, units, returns
-- Pick the best dataset for the query
-- Metrics should be measure columns; dimensions should be grouping/time/category columns
-- Use conversation context to fill in omitted dataset or columns when needed
-
-Examples:
-Q: max and min user signups
-{"intent":"ranking","dataset":"customer_behavior","metrics":["signups"],"dimensions":["week"],"analysis":["max","min"]}
-
-Q: Are customers happy?
-{"intent":"sentiment","dataset":"customer_feedback","metrics":["text"],"dimensions":["region"],"analysis":["sentiment"]}
-
-Q: revenue by region over time
-{"intent":"trend","dataset":"sales_performance","metrics":["revenue"],"dimensions":["month","region"],"analysis":["trend"]}
-`;
 
 /**
  * Parse a natural-language question into a structured analysis plan.
- * Uses Gemini API if available; falls back to local regex parsing.
+ * Sends { question, registry, context } to the backend; falls back to local
+ * regex parsing if the backend is unreachable or the user is unauthenticated.
  *
  * @param {string}   question
- * @param {object[]} registryMetadata  — dataset summaries (no raw data)
+ * @param {object[]} registryMetadata    — dataset summaries (no raw data)
  * @param {object[]} conversationContext — last N messages [{ role, content }]
- * @returns {Promise<object>}  analysis plan
+ * @returns {Promise<object>} analysis plan
  */
 export async function parseQuery(question, registryMetadata, conversationContext = []) {
-  if (!isApiAvailable() || !_reserveApiCall()) {
+  if (!_reserveApiCall()) {
     return fallbackParseQuery(question, registryMetadata);
   }
 
-  const registryText = _buildRegistryText(registryMetadata);
-  const contextText = _buildContextText(conversationContext);
-
-  const prompt = `Available datasets:
-${registryText}
-
-Previous conversation:
-${contextText}
-
-User question: "${question}"`;
-
   try {
-    const raw = await _callGemini(prompt, PARSE_QUERY_SYSTEM);
+    const { raw } = await llmApi.parse({
+      question,
+      registry: registryMetadata ?? [],
+      context: (conversationContext ?? []).slice(-3),
+    });
+    _apiHealthy = true;
     const json = JSON.parse(stripMarkdownFences(raw));
     return _normalizePlan(_coerceSentimentPlan(json, question, registryMetadata), question);
   } catch (err) {
+    _apiHealthy = false;
     console.warn("[geminiApi] parseQuery fell back to local:", err.message);
     return fallbackParseQuery(question, registryMetadata);
   }
 }
 
 /* ═══════════════════════════════════════════════════════════
-   §4  generateNarrative
+   §4  generateNarrative  (calls backend /api/llm/narrative)
 ═══════════════════════════════════════════════════════════ */
 
-const NARRATIVE_SYSTEM = `You are a data analyst explaining results to a non-technical business user.
-
-You MUST structure EVERY response using exactly these four sections. Use the exact emoji headers:
-
-✅ Final Answer
-(1–3 plain sentences. State the key finding directly with specific numbers. No jargon.)
-
-📊 Key Insight
-(1–2 sentences. Explain the main driver, pattern, or reason behind the result. Include % change or comparison where relevant.)
-
-📁 Data Reference
-(Single line. List the exact column names or fields used to reach this answer.)
-
-⚠️ Notes
-(Any assumptions made, data limitations, or caveats. If none, write “None.”)
-
-Rules:
-- Use SPECIFIC numbers from the results with commas for readability (e.g., 12,500 not 12500).
-- Do NOT hedge with “based on the data” or “according to the analysis” — state findings directly.
-- Do NOT skip any section.
-- Keep each section SHORT — no walls of text.
-- Plain language only — no SQL, no code, no technical jargon.
-- If a comparison is made, always state the % change or absolute difference.
-- If the query was ambiguous, state the assumption you made in ⚠️ Notes.`;
-
 /**
- * Generate a 2-4 sentence plain-English narrative for analysis results.
- * Uses Gemini API if available; falls back to template-based generation.
+ * Generate a plain-English narrative for analysis results.
+ * Sends { question, result, metadata } to the backend; falls back to
+ * template-based narratives if the backend is unreachable.
  *
  * @param {object} analysisResults — { result, metadata } from analysisOps
  * @param {string} question
- * @param {object[]} [metricDefinitions] — data-dictionary entries for context
+ * @param {object[]} [metricDefinitions] — data-dictionary entries (unused remote, kept for signature compat)
  * @returns {Promise<string>}
  */
-// export async function generateNarrative(analysisResults, question, metricDefinitions = []) {
-//   // Always use deterministic local narrative templates.
-//   // The Groq model (llama-3.1-8b-instant) frequently hallucinates error narratives
-//   // on valid results (e.g., claiming "column not found" when the analysis succeeded).
-//   // The local templates handle every result type reliably and are well-tested.
-//   // Groq is still used for parseQuery (query understanding) where it performs well.
-//   return fallbackNarrative(analysisResults, question);
-// }
-export async function generateNarrative(
-  analysisResults,
-  question,
-  metricDefinitions = []
-) {
-  // 🚫 If API unavailable → fallback
-  if (!isApiAvailable() || !_reserveApiCall()) {
+// eslint-disable-next-line no-unused-vars
+export async function generateNarrative(analysisResults, question, metricDefinitions = []) {
+  if (!_reserveApiCall()) {
     return fallbackNarrative(analysisResults, question);
   }
 
-  // 🚫 If result has error → NEVER send to LLM
+  // Never ship error results to the LLM — local templates handle these cleanly.
   if (
     !analysisResults ||
     !analysisResults.result ||
-    (Array.isArray(analysisResults.result) &&
-      analysisResults.result[0]?.error)
+    (Array.isArray(analysisResults.result) && analysisResults.result[0]?.error)
   ) {
     return fallbackNarrative(analysisResults, question);
   }
 
   try {
-    // ✅ Build safe summary (already implemented by you)
-    const summary = _buildResultSummary(
-      analysisResults.result,
-      analysisResults.metadata
-    );
-
-    const prompt = `
-User Question:
-"${question}"
-
-Computed Results:
-${summary}
-
-Explain these results clearly.
-`;
-
-    const STRICT_NARRATIVE_SYSTEM = `
-You are a professional data analyst.
-
-You are given VERIFIED computed results from a system.
-These numbers are ALWAYS correct.
-
-Your job is ONLY to explain them clearly.
-
-STRICT RULES:
-- DO NOT invent any numbers
-- DO NOT assume missing data
-- ONLY use the numbers provided
-- If something is missing, say "Not available"
-- NEVER mention errors unless explicitly present in results
-- Keep it simple and natural
-
-FORMAT:
-
-✅ Final Answer
-(1–2 sentences, direct answer with numbers)
-
-📊 Key Insight
-(1–2 sentences explaining why)
-
-📁 Data Reference
-(List column names or fields used)
-
-⚠️ Notes
-(Assumptions or "None")
-`;
-
-    const raw = await _callGemini(prompt, STRICT_NARRATIVE_SYSTEM);
-
-    return raw;
+    const { text } = await llmApi.narrative({
+      question,
+      result: analysisResults.result,
+      metadata: analysisResults.metadata ?? {},
+    });
+    _apiHealthy = true;
+    return text;
   } catch (err) {
-    console.warn("[geminiApi] Narrative fell back to local:", err.message);
+    _apiHealthy = false;
+    console.warn("[geminiApi] narrative fell back to local:", err.message);
     return fallbackNarrative(analysisResults, question);
   }
 }

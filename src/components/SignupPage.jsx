@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Database, Mail, Lock, Eye, EyeOff, User, Shield, Users, FileText, BarChart3, ArrowRight, Check, KeyRound, X, AlignCenter } from "lucide-react";
+import { Database, Mail, Lock, Eye, EyeOff, User, Shield, Users, FileText, BarChart3, ArrowRight, Check, X } from "lucide-react";
 import { useApp } from "../context/AppContext";
 
 const PASSWORD_RULES = [
@@ -34,7 +34,7 @@ const ROLES = [
 ];
 
 export default function SignupPage() {
-  const { signup, verifyOtp, setAuthView } = useApp();
+  const { signup, setAuthView } = useApp();
 
   /* ── Signup form state ── */
   const [name, setName] = useState("");
@@ -46,11 +46,6 @@ export default function SignupPage() {
   const [showConfirm, setShowConfirm] = useState(false);
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  /* ── OTP step state ── */
-  const [otpStep, setOtpStep] = useState(false);   // true once signup succeeds
-  const [signupEmail, setSignupEmail] = useState(""); // locked email for OTP verify
-  const [otp, setOtp] = useState("");
 
   const passwordValid = PASSWORD_RULES.every((r) => r.test(password));
 
@@ -78,150 +73,8 @@ export default function SignupPage() {
       setIsSubmitting(false);
       return;
     }
-    // Move to OTP step
-    setSignupEmail(email.trim().toLowerCase());
-    setOtpStep(true);
-    setIsSubmitting(false);
+    // On success, AppContext session state drives navigation automatically.
   };
-
-  /* ── Submit OTP ── */
-  const handleVerifyOtp = async (e) => {
-    e.preventDefault();
-    if (!otp || otp.length < 6) {
-      setError("Please enter the 6-digit code from your email.");
-      return;
-    }
-    setError("");
-    setIsSubmitting(true);
-
-    const result = await verifyOtp(signupEmail, otp.trim());
-    if (!result.success) {
-      setError(result.message);
-      setIsSubmitting(false);
-    }
-    // On success, onAuthStateChange in AppContext handles navigation automatically
-  };
-
-  /* ─────────────────────────────── OTP screen ─────────────────────────────── */
-  if (otpStep) {
-    return (
-      <div
-        className="min-h-screen flex items-center justify-center px-4 py-8"
-        style={{ background: "#f8f9fb", fontFamily: "'Plus Jakarta Sans', sans-serif" }}
-      >
-        <link
-          href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
-          rel="stylesheet"
-        />
-
-        <div className="w-full max-w-md">
-          {/* Logo */}
-          <div className="flex flex-col items-center mb-8">
-            <div
-              className="w-14 h-14 rounded-2xl flex items-center justify-center mb-4"
-              style={{ background: "linear-gradient(135deg, #4f46e5, #7c3aed)" }}
-            >
-              <Database size={26} color="#fff" />
-            </div>
-            <h1
-              className="text-2xl font-bold tracking-tight"
-              style={{ fontFamily: "'JetBrains Mono', monospace", color: "#1a1a2e" }}
-            >
-              InSightify
-            </h1>
-            <p className="text-sm mt-1" style={{ color: "#9ca3af" }}>Talk to Your Data</p>
-          </div>
-
-          {/* Card */}
-          <div
-            className="rounded-2xl border p-8"
-            style={{ background: "#fff", borderColor: "#e8eaed", boxShadow: "0 4px 24px rgba(79,70,229,0.07)" }}
-          >
-            {/* Icon */}
-            <div className="flex justify-center mb-5">
-              <div
-                className="w-14 h-14 rounded-2xl flex items-center justify-center"
-                style={{ background: "#f0f0ff" }}
-              >
-                <KeyRound size={26} style={{ color: "#4f46e5" }} />
-              </div>
-            </div>
-
-            <h2 className="text-xl font-bold mb-1 text-center" style={{ color: "#1a1a2e" }}>
-              Verify your email
-            </h2>
-            <p className="text-sm mb-1 text-center" style={{ color: "#9ca3af" }}>
-              We sent a 6-digit code to
-            </p>
-            <p className="text-sm font-semibold mb-6 text-center" style={{ color: "#4f46e5" }}>
-              {signupEmail}
-            </p>
-
-            {error && (
-              <div
-                className="mb-5 px-4 py-3 rounded-xl text-sm font-medium"
-                style={{ background: "#fef2f2", color: "#ef4444", border: "1px solid #fecaca" }}
-              >
-                {error}
-              </div>
-            )}
-
-            <form onSubmit={handleVerifyOtp} className="space-y-4">
-              <div>
-                <label className="block text-sm font-semibold mb-1.5" style={{ color: "#1a1a2e" }}>
-                  Verification code
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={6}
-                  value={otp}
-                  onChange={(e) => { setOtp(e.target.value.replace(/\D/g, "")); if (error) setError(""); }}
-                  placeholder="000000"
-                  className="w-full px-4 py-3 rounded-xl border text-sm outline-none transition-colors text-center tracking-[0.4em] font-bold"
-                  style={{ borderColor: "#e8eaed", background: "#fff", color: "#1a1a2e", fontSize: "1.25rem" }}
-                  onFocus={(e) => (e.target.style.borderColor = "#4f46e5")}
-                  onBlur={(e) => (e.target.style.borderColor = "#e8eaed")}
-                  autoFocus
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={isSubmitting || otp.length < 6}
-                className="w-full py-3 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-2"
-                style={{
-                  background: "linear-gradient(135deg, #4f46e5, #7c3aed)",
-                  opacity: isSubmitting || otp.length < 6 ? 0.7 : 1,
-                  cursor: isSubmitting || otp.length < 6 ? "not-allowed" : "pointer",
-                  marginTop: "8px",
-                }}
-              >
-                {isSubmitting ? (
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <>Verify &amp; continue <ArrowRight size={15} /></>
-                )}
-              </button>
-            </form>
-
-            <p className="text-center text-sm mt-6" style={{ color: "#9ca3af" }}>
-              Didn&apos;t receive it? Check your spam folder or{" "}
-              <button
-                onClick={() => { setOtpStep(false); setOtp(""); setError(""); }}
-                className="font-semibold hover:underline"
-                style={{ color: "#4f46e5", background: "none", border: "none", cursor: "pointer" }}
-              >
-                go back
-              </button>
-            </p>
-          </div>
-        </div>
-
-        <style>{`* { box-sizing: border-box; } body { margin: 0; }`}</style>
-      </div>
-    );
-  }
 
   /* ─────────────────────────────── Signup form ─────────────────────────────── */
   return (

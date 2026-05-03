@@ -9,14 +9,11 @@ import { registerCSV, removeDataset } from "../engine/dataRegistry.js";
 import {
   getRestrictions,
   getRoles,
-  getAccessRequests,
-  approveRequest,
-  denyRequest,
-  createAccessRequest,
-  applyApprovedRequests,
+  setMyRestrictions,
   resetRestrictionIndex,
 } from "../engine/accessControl.js";
-import { supabase } from "../lib/supabase.js";
+import { authApi, accessApi, setToken, getToken } from "../lib/api.js";
+import { connectSocket, disconnectSocket } from "../lib/socket.js";
 
 const AppContext = createContext(null);
 
@@ -97,16 +94,17 @@ export function AppProvider({ children }) {
   const dictRef     = useRef(null);
   const restrictRef = useRef(null);
 
-  /* ── Fetch access requests from Supabase + sync restriction index ── */
-  const fetchAccessRequests = useCallback(async () => {
+  /* ── Fetch access state from backend (requests + my effective restrictions) ── */
+  const fetchAccessState = useCallback(async () => {
     try {
-      const requests = await getAccessRequests();
-      // Rebuild restriction index from scratch then apply approved grants
-      resetRestrictionIndex();
-      applyApprovedRequests(requests);
+      const [{ requests }, { restrictions }] = await Promise.all([
+        accessApi.listRequests(),
+        accessApi.myRestrictions(),
+      ]);
+      setMyRestrictions(restrictions);
       setAccessRequests(requests);
     } catch (err) {
-      console.error("Failed to fetch access requests:", err);
+      console.error("Failed to fetch access state:", err);
     }
   }, []);
 
@@ -128,120 +126,82 @@ export function AppProvider({ children }) {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  /* ── Build user object: reads role from profiles table (editable in Supabase dashboard),
-        falls back to user_metadata if the profile row doesn't exist yet ── */
-  const buildUser = useCallback(async (session) => {
-    const meta = session.user.user_metadata;
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("name, role")
-      .eq("id", session.user.id)
-      .single();
-    return {
-      id:    session.user.id,
-      email: session.user.email,
-      name:  profile?.name  ?? meta?.name  ?? session.user.email,
-      role:  profile?.role  ?? meta?.role  ?? "Owner",
-    };
-  }, []);
-
-  /* ── Supabase auth: restore session on mount + listen for auth state changes ── */
+  /* ── JWT auth: restore session on mount by calling /api/auth/me ── */
   useEffect(() => {
     let mounted = true;
 
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
-      if (!mounted) return;
-      if (session) {
-        const u = await buildUser(session);
+    const restore = async () => {
+      if (!getToken()) {
+        if (mounted) setIsAuthLoading(false);
+        return;
+      }
+      try {
+        const { user } = await authApi.me();
         if (!mounted) return;
-        setCurrentUser(u);
-        setRole(u.role);
+        setCurrentUser(user);
+        setRole(user.role);
         setIsAuthenticated(true);
+      } catch {
+        setToken(null);
+      } finally {
+        if (mounted) setIsAuthLoading(false);
       }
-      setIsAuthLoading(false);
-    });
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!mounted) return;
-      if (session) {
-        buildUser(session).then((u) => {
-          if (!mounted) return;
-          setCurrentUser(u);
-          setRole(u.role);
-          setIsAuthenticated(true);
-        });
-      } else {
-        setCurrentUser(null);
-        setIsAuthenticated(false);
-        setRole("Owner");
-      }
-    });
-
-    return () => {
-      mounted = false;
-      subscription.unsubscribe();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* ── Real-time access requests: fetch on login + subscribe for live updates ── */
+    restore();
+    return () => { mounted = false; };
+  }, []);
+
+  /* ── Real-time access requests: socket.io listener + initial load ── */
   useEffect(() => {
     if (!isAuthenticated) return;
 
-    // Initial load
-    fetchAccessRequests();
+    fetchAccessState();
 
-    // Subscribe to all changes on the access_requests table
-    const channel = supabase
-      .channel("access_requests_realtime")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "access_requests" },
-        () => { fetchAccessRequests(); }
-      )
-      .subscribe();
+    const token = getToken();
+    if (!token) return;
+
+    const socket = connectSocket(token);
+    const handler = () => fetchAccessState();
+    socket.on("access_requests:changed", handler);
 
     return () => {
-      supabase.removeChannel(channel);
+      socket.off("access_requests:changed", handler);
     };
-  }, [isAuthenticated, fetchAccessRequests]);
+  }, [isAuthenticated, fetchAccessState]);
 
-  /* ── Auth functions ── */
+  /* ── Auth functions (backend JWT) ── */
+  const applySession = ({ user, token }) => {
+    setToken(token);
+    setCurrentUser(user);
+    setRole(user.role);
+    setIsAuthenticated(true);
+  };
+
   const login = async (email, password) => {
     try {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) return { success: false, message: error.message };
+      const data = await authApi.login({ email, password });
+      applySession(data);
       return { success: true };
-    } catch {
-      return { success: false, message: "Something went wrong. Please try again." };
+    } catch (err) {
+      return { success: false, message: err.message ?? "Login failed" };
     }
   };
 
   const signup = async (name, email, password, selectedRole) => {
     try {
-      const { error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: { data: { name, role: selectedRole } },
-      });
-      if (error) return { success: false, message: error.message };
-      return { success: true, needsOtp: true };
-    } catch {
-      return { success: false, message: "Something went wrong. Please try again." };
-    }
-  };
-
-  const verifyOtp = async (email, token) => {
-    try {
-      const { error } = await supabase.auth.verifyOtp({ email, token, type: "signup" });
-      if (error) return { success: false, message: error.message };
+      const data = await authApi.signup({ name, email, password, role: selectedRole });
+      applySession(data);
       return { success: true };
-    } catch {
-      return { success: false, message: "Something went wrong. Please try again." };
+    } catch (err) {
+      return { success: false, message: err.message ?? "Signup failed" };
     }
   };
 
   const logout = async () => {
-    await supabase.auth.signOut();
+    try { await authApi.logout(); } catch { /* ignore — stateless JWT */ }
+    disconnectSocket();
+    setToken(null);
     resetRestrictionIndex();
     setAccessRequests([]);
     setCurrentUser(null);
@@ -312,17 +272,21 @@ export function AppProvider({ children }) {
 
   /* ── Approve / Deny access request ── */
   const handleAccess = async (id, approved) => {
+    const newStatus = approved ? "approved" : "denied";
+    // Optimistic UI: flip the status locally so the buttons disappear
+    // immediately. Server-confirm in the background; resync on completion.
+    setAccessRequests((prev) =>
+      prev.map((r) =>
+        r.id === id ? { ...r, status: newStatus, resolved_at: new Date().toISOString() } : r
+      )
+    );
     try {
-      if (approved) {
-        await approveRequest(id);
-      } else {
-        await denyRequest(id);
-      }
-      // fetchAccessRequests will also be triggered by real-time subscription,
-      // but call it here too so the UI updates immediately for the Owner.
-      await fetchAccessRequests();
+      await accessApi.resolveRequest(id, newStatus);
+      await fetchAccessState();
       showNotif(approved ? "Access approved successfully" : "Access request denied");
     } catch {
+      // Roll back by refetching authoritative state
+      await fetchAccessState();
       showNotif("Failed to process request. Please try again.");
     }
   };
@@ -450,8 +414,8 @@ export function AppProvider({ children }) {
   /* ── Request access (from AccessBlockedMsg) ── */
   const handleRequestAccess = async (columns) => {
     try {
-      await createAccessRequest(role, currentUser?.id, currentUser?.name, columns, "Requested via query");
-      await fetchAccessRequests();
+      await accessApi.createRequest({ columns, reason: "Requested via query" });
+      await fetchAccessState();
       showNotif("Access request sent to data owner");
     } catch {
       showNotif("Failed to send access request. Please try again.");
@@ -463,7 +427,7 @@ export function AppProvider({ children }) {
       value={{
         // Auth
         isAuthenticated, isAuthLoading, currentUser, authView, setAuthView,
-        login, signup, verifyOtp, logout,
+        login, signup, logout,
         // Tab
         activeTab, setActiveTab,
         // Role
