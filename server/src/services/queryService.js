@@ -181,7 +181,7 @@ const RAG_TOP_K = 10;
 async function handleUnstructuredQuery(question, dataset) {
   try {
     const { retrieve } = await import("./retrievalService.js");
-    const { chunks, totalScanned, queryEmbedMs } = await retrieve(
+    const { chunks, totalScanned, queryEmbedMs, backend } = await retrieve(
       { datasetId: dataset.id ?? dataset._id },
       question,
       RAG_TOP_K
@@ -215,11 +215,12 @@ Do not assume anything not present in the data. If the rows do not contain enoug
     return {
       type: "text",
       answer,
-      source: `Unstructured Dataset (RAG retrieved ${chunks.length}/${totalScanned} rows)`,
+      source: `Unstructured Dataset (RAG retrieved ${chunks.length}/${totalScanned} rows via ${backend})`,
       datasetName: dataset.name,
       rowCount: totalScanned,
       retrieved: chunks.map((c) => ({ rowIndex: c.rowIndex, text: c.text, score: +c.score.toFixed(4) })),
       queryEmbedMs,
+      retrievalBackend: backend,
     };
   } catch (err) {
     return {

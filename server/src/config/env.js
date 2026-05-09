@@ -13,6 +13,14 @@ const schema = z.object({
   GROQ_API_KEY: z.string().optional(),
   GROQ_MODEL: z.string().default("llama-3.1-8b-instant"),
   GROQ_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.1),
+
+  // RAG retrieval backend.
+  //   "memory" → in-process cosine similarity (no Atlas setup required)
+  //   "atlas"  → MongoDB Atlas Vector Search via $vectorSearch aggregation;
+  //              requires a vector search index named ATLAS_VECTOR_INDEX
+  //              on the documentchunks collection
+  RETRIEVAL_BACKEND:    z.enum(["memory", "atlas"]).default("memory"),
+  ATLAS_VECTOR_INDEX:   z.string().default("vector_index"),
 });
 
 const parsed = schema.safeParse(process.env);
