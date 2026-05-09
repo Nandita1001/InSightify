@@ -1,19 +1,22 @@
 /**
- * queryEngine.js — Central Query Orchestrator
+ * queryService — Central Query Orchestrator (server-side).
  *
- * Coordinates: parseQuery → accessControl → dataRegistry → analysisOps → generateNarrative
+ * Coordinates: LLM parse → access control → analysis ops → LLM narrative
  * to turn a natural-language question into a fully structured response.
+ *
+ * Request-scoped registry: each call to processQuery loads only the datasets
+ * visible to the authenticated user (built-ins + their own uploads). A small
+ * shim exposes the same `getRegistry`/`getDataset`/`findDatasetByName`/
+ * `getDatasetSummary` API the original client engine relied on.
  */
 
-/* ── Registry ── */
-import {
-  getRegistry,
-  getDataset,
-  findDatasetByName,
-  getDatasetSummary,
-} from "./dataRegistry.js";
+import { Dataset } from "../models/Dataset.js";
+import { datasetService } from "./datasetService.js";
+import { llmService } from "./llmService.js";
+import { groqChat, isGroqConfigured } from "./groqService.js";
+import { getRoleRestrictions, isOwner } from "../config/permissions.js";
+import { AccessRequest } from "../models/AccessRequest.js";
 
-/* ── Analysis operations ── */
 import {
   aggregate,
   filter,
@@ -36,22 +39,98 @@ import {
   parseDateColumn,
 } from "./analysisOps.js";
 
-/* ── Access control ── */
 import {
-  checkAccess,
-  getRestrictions,
-} from "./accessControl.js";
-
-/* ── Gemini API + fallbacks ── */
-import {
-  parseQuery,
-  generateNarrative,
+  stripMarkdownFences,
+  normalizePlan,
+  coerceSentimentPlan,
   fallbackParseQuery,
   fallbackNarrative,
-  isApiAvailable,
-} from "./geminiApi.js";
+} from "./queryFallbacks.js";
 
-import { DATA_DICTIONARY } from "../data/dataDictionary.js";
+import { DATA_DICTIONARY } from "../config/dataDictionary.js";
+
+/* ═══════════════════════════════════════════════════════════
+   REQUEST-SCOPED HELPERS  (replaces module-level dataRegistry + accessControl)
+═══════════════════════════════════════════════════════════ */
+
+/**
+ * Load the datasets visible to this user/request.
+ * - Company tab: all company-source datasets
+ * - Upload tab + datasetId: just that one user-owned dataset (after RBAC check)
+ *
+ * Returns objects shaped like the legacy registry entries:
+ * { id, name, description, source, type, rowCount, columns, data }
+ */
+async function loadRequestRegistry(user, activeTab, datasetId) {
+  if (activeTab === "upload" && datasetId) {
+    const doc = await Dataset.findById(datasetId);
+    if (!doc) return [];
+    if (doc.source === "user" && doc.ownerId?.toString() !== user._id.toString()) return [];
+    return [_docToEntry(doc)];
+  }
+  const docs = await Dataset.find({ source: "company" });
+  return docs.map(_docToEntry);
+}
+
+function _docToEntry(doc) {
+  return {
+    id:          doc._id.toString(),
+    name:        doc.name,
+    description: doc.description,
+    source:      doc.source,
+    type:        doc.type,
+    rowCount:    doc.rowCount,
+    columns:     doc.columns,
+    data:        doc.rows,
+  };
+}
+
+/**
+ * Server-side access check for column-level RBAC. Combines the role baseline
+ * with any per-user approved access requests.
+ */
+async function checkAccessForUser(user, requiredColumns) {
+  if (isOwner(user.role)) return { allowed: true, blockedColumns: [] };
+
+  const baseline = getRoleRestrictions(user.role);
+  if (baseline.length === 0) return { allowed: true, blockedColumns: [] };
+
+  const approved = await AccessRequest.find({
+    userId: user._id,
+    status: "approved",
+  }).select("columns");
+
+  const grantedSet = new Set();
+  for (const req of approved) {
+    for (const col of req.columns) grantedSet.add(col.toLowerCase());
+  }
+
+  const restrictedSet = new Set(
+    baseline.filter(({ col }) => !grantedSet.has(col.toLowerCase())).map((r) => r.col.toLowerCase())
+  );
+  const reasonByCol = new Map(baseline.map((r) => [r.col.toLowerCase(), r.reason]));
+
+  const blocked = [];
+  for (const col of requiredColumns ?? []) {
+    if (restrictedSet.has(String(col).toLowerCase())) {
+      blocked.push({ col, reason: reasonByCol.get(String(col).toLowerCase()) ?? "Restricted" });
+    }
+  }
+  return { allowed: blocked.length === 0, blockedColumns: blocked };
+}
+
+async function getRestrictionsForUser(user) {
+  if (isOwner(user.role)) return [];
+  const baseline = getRoleRestrictions(user.role);
+  if (baseline.length === 0) return [];
+  const approved = await AccessRequest.find({
+    userId: user._id,
+    status: "approved",
+  }).select("columns");
+  const grantedSet = new Set();
+  for (const req of approved) for (const c of req.columns) grantedSet.add(c.toLowerCase());
+  return baseline.filter(({ col }) => !grantedSet.has(col.toLowerCase()));
+}
 
 /* ═══════════════════════════════════════════════════════════
    HELPERS
@@ -81,80 +160,66 @@ function extractFormulaColumns(formula, set) {
 }
 
 async function callGroqForUnstructured(prompt) {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("Groq API key is missing.");
-  }
-
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "llama-3.1-8b-instant",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => response.statusText);
-    throw new Error(`Groq API ${response.status}: ${errText}`);
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content?.trim();
-
-  if (!text) {
-    throw new Error("Groq returned empty response.");
-  }
-
-  return text;
+  if (!isGroqConfigured()) throw new Error("Groq API key is missing.");
+  const text = await groqChat({ user: prompt });
+  return text.trim();
 }
 
-function formatUnstructuredRows(rows = []) {
-  return rows
-    .map((row) =>
-      Object.values(row ?? {})
-        .filter((value) => value !== null && value !== undefined && String(value).trim() !== "")
-        .map((value) => String(value).trim())
-        .join(" | ")
-    )
-    .filter(Boolean)
-    .join("\n");
-}
+const RAG_TOP_K = 10;
 
+/**
+ * RAG-backed handler for unstructured datasets.
+ *
+ * 1. Embed the question
+ * 2. Retrieve the top-K most similar chunks (rows) from this dataset only
+ * 3. Build a grounded prompt with just those chunks + the question
+ * 4. Call the LLM
+ *
+ * The trust panel now reports "retrieved X of Y rows", which is much more
+ * honest than the previous "we sent the LLM the whole file" pattern.
+ */
 async function handleUnstructuredQuery(question, dataset) {
   try {
-    const datasetText = formatUnstructuredRows(dataset?.data ?? []).slice(0, 12000);
+    const { retrieve } = await import("./retrievalService.js");
+    const { chunks, totalScanned, queryEmbedMs } = await retrieve(
+      { datasetId: dataset.id ?? dataset._id },
+      question,
+      RAG_TOP_K
+    );
 
-    if (!datasetText) {
+    if (totalScanned === 0) {
       return {
         type: "error",
-        message: "The unstructured dataset does not contain any readable text.",
+        message: "This dataset has no embedded chunks yet. Try re-uploading the file.",
       };
     }
 
+    const context = chunks
+      .map((c) => `[Row ${c.rowIndex + 1}] ${c.text}`)
+      .join("\n");
+
     const prompt = `You are a data analyst.
+A retrieval system has selected the most relevant rows from the user's dataset.
 
 User Question:
 ${question}
 
-Dataset:
-${datasetText}
+Relevant rows (top ${chunks.length} of ${totalScanned}):
+${context}
 
-Answer ONLY based on the dataset.
-Do not assume anything not present in the data.`;
+Answer ONLY based on the rows above. Cite row numbers when useful.
+Do not assume anything not present in the data. If the rows do not contain enough information, say so.`;
 
     const answer = await callGroqForUnstructured(prompt);
 
     return {
       type: "text",
       answer,
-      source: "Unstructured Dataset (Groq)",
+      source: `Unstructured Dataset (RAG retrieved ${chunks.length}/${totalScanned} rows)`,
+      datasetName: dataset.name,
+      rowCount: totalScanned,
+      retrieved: chunks.map((c) => ({ rowIndex: c.rowIndex, text: c.text, score: +c.score.toFixed(4) })),
+      queryEmbedMs,
     };
   } catch (err) {
     return {
@@ -574,28 +639,68 @@ function repairSentimentPlan(plan, question, availableDatasets) {
  * @param {string|null} uploadedDatasetId — Registry id of the uploaded dataset (if any)
  * @returns {Promise<object>}             — Structured response for the UI
  */
-export async function processQuery(
+export async function processQuery({
+  user,
   question,
-  role,
-  conversationContext,
+  context: conversationContext = [],
   activeTab,
-  uploadedDatasetId,
-  user = {}
-) {
+  datasetId: uploadedDatasetId,
+}) {
   try {
+    const role = user.role;
+    /* ── Load request-scoped registry (replaces module-level _registry) ── */
+    const registry = await loadRequestRegistry(user, activeTab, uploadedDatasetId);
+    const _registryById = new Map(registry.map((d) => [d.id, d]));
+    const getRegistry = () => registry;
+    const getDataset = (id) => _registryById.get(id);
+    const findDatasetByName = (name) => {
+      const needle = String(name ?? "").toLowerCase();
+      if (!needle) return undefined;
+      return registry.find((d) => d.name.toLowerCase().includes(needle));
+    };
+    const getDatasetSummary = (id) => {
+      const d = _registryById.get(id);
+      if (!d) return undefined;
+      const { data: _data, ...rest } = d; void _data;
+      return rest;
+    };
+
+    // Inline LLM helpers (replace old client geminiApi exports)
+    const parseQuery = async (q, registryMeta, ctx = []) => {
+      try {
+        const { raw } = await llmService.parse({ question: q, registry: registryMeta, context: ctx });
+        return normalizePlan(coerceSentimentPlan(JSON.parse(stripMarkdownFences(raw)), q, registryMeta), q);
+      } catch (err) {
+        console.warn("[queryService] LLM parse failed, falling back:", err.message);
+        return fallbackParseQuery(q, registryMeta);
+      }
+    };
+    const generateNarrative = async (analysisResults, q) => {
+      try {
+        const { text } = await llmService.narrative({
+          question: q,
+          result: analysisResults.result,
+          metadata: analysisResults.metadata ?? {},
+        });
+        return text;
+      } catch (err) {
+        console.warn("[queryService] LLM narrative failed, falling back:", err.message);
+        return fallbackNarrative(analysisResults, q);
+      }
+    };
+    const isApiAvailable = () => isGroqConfigured();
+
     /* ── Step 1: Build available datasets ── */
     let availableDatasets;
 
     if (activeTab === "upload" && uploadedDatasetId) {
-      // User mode: only the dataset they uploaded
       const summary = getDatasetSummary(uploadedDatasetId);
       availableDatasets = summary ? [summary] : [];
     } else {
-      // Company mode: all company-sourced datasets (excludes uploads)
       availableDatasets = getRegistry()
         .filter((ds) => ds.source === "company")
         .map((ds) => getDatasetSummary(ds.id))
-        .filter(Boolean); // drop any undefined summaries
+        .filter(Boolean);
     }
 
     if (availableDatasets.length === 0) {
@@ -752,14 +857,14 @@ export async function processQuery(
     }
 
     /* ── Step 5: Access control — MUST run before any data processing ── */
-    const accessResult = checkAccess(role, user.id, Array.from(allRequiredColumns));
+    const accessResult = await checkAccessForUser(user, Array.from(allRequiredColumns));
 
     if (!accessResult.allowed) {
       return {
         type: "blocked",
         blockedColumns: accessResult.blockedColumns,
         role,
-        restrictions: getRestrictions(role, user.id),
+        restrictions: await getRestrictionsForUser(user),
       };
     }
 
@@ -856,7 +961,7 @@ export async function processQuery(
    EXTRA EXPORTS
 ═══════════════════════════════════════════════════════════ */
 
-export function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owner") {
+export async function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owner") {
   if (activeTab === "company") {
     // Role-specific suggestions — avoid suggesting columns that are restricted
     const isMarketing = role === "Marketing Team";
@@ -905,13 +1010,13 @@ export function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owne
   }
 
   if (activeTab === "upload" && uploadedDatasetId) {
-    const ds = getDatasetSummary(uploadedDatasetId);
-    if (!ds) return [];
+    const doc = await Dataset.findById(uploadedDatasetId).select("columns");
+    if (!doc) return [];
 
-    const numericCols = ds.columns.filter((c) => c.type === "numeric");
-    const catCols     = ds.columns.filter((c) => c.type === "categorical");
-    const textCols    = ds.columns.filter((c) => c.type === "text");
-    const dateCols    = ds.columns.filter((c) => c.type === "date");
+    const numericCols = doc.columns.filter((c) => c.type === "numeric");
+    const catCols     = doc.columns.filter((c) => c.type === "categorical");
+    const textCols    = doc.columns.filter((c) => c.type === "text");
+    const dateCols    = doc.columns.filter((c) => c.type === "date");
 
     const suggested = [];
     if (numericCols.length > 0 && catCols.length > 0) {
@@ -936,41 +1041,38 @@ export function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owne
   return [];
 }
 
-export function getDataDictionary(activeTab, uploadedDatasetId) {
+export async function getDataDictionary(activeTab, uploadedDatasetId) {
   const predefined = DATA_DICTIONARY;
-  
-  if (activeTab === "company") {
-     return predefined;
-  } else if (activeTab === "upload" && uploadedDatasetId) {
-     const ds = getDatasetSummary(uploadedDatasetId);
-     if (!ds) return predefined;
-     
-     const autoGenerated = ds.columns.map(c => ({
-        name: c.name,
-        def: c.description || `Autodetected ${c.type} column`
-     }));
-     
-     // Merge without duplicate names
-     const all = [...predefined];
-     for (const ag of autoGenerated) {
-        if (!all.find(d => d.name.toLowerCase() === ag.name.toLowerCase())) {
-           all.push(ag);
-        }
-     }
-     return all;
+
+  if (activeTab === "company") return predefined;
+
+  if (activeTab === "upload" && uploadedDatasetId) {
+    const doc = await Dataset.findById(uploadedDatasetId).select("columns");
+    if (!doc) return predefined;
+
+    const autoGenerated = doc.columns.map((c) => ({
+      name: c.name,
+      def:  c.description || `Autodetected ${c.type} column`,
+    }));
+
+    const all = [...predefined];
+    for (const ag of autoGenerated) {
+      if (!all.find((d) => d.name.toLowerCase() === ag.name.toLowerCase())) all.push(ag);
+    }
+    return all;
   }
   return predefined;
 }
 
-export function getRegistryInfo() {
-   const reg = getRegistry();
-   return {
-      totalDatasets: reg.length,
-      datasets: reg.map(d => ({
-         name: d.name,
-         source: d.source,
-         rowCount: d.rowCount,
-         columns: d.columns.length
-      }))
-   };
+export async function getRegistryInfo(user) {
+  const docs = await datasetService.listFor(user);
+  return {
+    totalDatasets: docs.length,
+    datasets: docs.map((d) => ({
+      name: d.name,
+      source: d.source,
+      rowCount: d.rowCount,
+      columns: d.columns.length,
+    })),
+  };
 }

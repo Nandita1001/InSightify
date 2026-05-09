@@ -5,6 +5,8 @@ import { env } from "./config/env.js";
 import { connectDB, disconnectDB } from "./config/db.js";
 import { createApp } from "./app.js";
 import { setIO } from "./services/realtime.js";
+import { seedBuiltIns } from "./services/datasetService.js";
+import { warmUp as warmUpEmbeddings } from "./services/embeddingService.js";
 import { verifyAccessToken } from "./utils/jwt.js";
 
 function attachSocketIO(httpServer) {
@@ -39,6 +41,16 @@ function attachSocketIO(httpServer) {
 
 async function bootstrap() {
   await connectDB();
+  // Seeding is best-effort — built-ins persist across boots, so a transient
+  // Atlas TLS drop here shouldn't crash the server. Log and continue.
+  try {
+    await seedBuiltIns();
+  } catch (err) {
+    console.warn("[server] seedBuiltIns failed (continuing):", err.message);
+  }
+  // Pre-load the embedding model in the background so the first user upload
+  // doesn't pay a 5–10s cold-start penalty.
+  warmUpEmbeddings();
   const app = createApp();
   const httpServer = http.createServer(app);
   attachSocketIO(httpServer);

@@ -7,6 +7,8 @@ import { env } from "./config/env.js";
 import authRoutes from "./routes/authRoutes.js";
 import llmRoutes from "./routes/llmRoutes.js";
 import accessRoutes from "./routes/accessRoutes.js";
+import datasetRoutes from "./routes/datasetRoutes.js";
+import queryRoutes from "./routes/queryRoutes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 
 export function createApp() {
@@ -21,6 +23,8 @@ export function createApp() {
   app.use("/api/auth", authRoutes);
   app.use("/api/llm", llmRoutes);
   app.use("/api/access", accessRoutes);
+  app.use("/api/datasets", datasetRoutes);
+  app.use("/api/query", queryRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

@@ -1,18 +1,11 @@
 import { createContext, useContext, useState, useEffect, useRef, useCallback } from "react";
 import {
-  processQuery,
-  getSuggestedQuestions,
-  getDataDictionary,
-  getRegistryInfo,
-} from "../engine/queryEngine.js";
-import { registerCSV, removeDataset } from "../engine/dataRegistry.js";
-import {
   getRestrictions,
   getRoles,
   setMyRestrictions,
   resetRestrictionIndex,
 } from "../engine/accessControl.js";
-import { authApi, accessApi, setToken, getToken } from "../lib/api.js";
+import { authApi, accessApi, datasetApi, queryApi, setToken, getToken } from "../lib/api.js";
 import { connectSocket, disconnectSocket } from "../lib/socket.js";
 
 const AppContext = createContext(null);
@@ -21,7 +14,6 @@ export function AppProvider({ children }) {
   /* ── Auth ── */
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
-  const [authView, setAuthView] = useState("login"); // "login" | "signup"
   const [isAuthLoading, setIsAuthLoading] = useState(true);
 
   /* ── Tab & Role ── */
@@ -77,13 +69,14 @@ export function AppProvider({ children }) {
   const currentMessages = isUploadTab ? uploadChat.messages : (activeChat?.messages ?? []);
   const displayMessages = currentMessages;
 
-  /* ── Derived engine values ── */
-  const restrictions       = getRestrictions(role, currentUser?.id);
-  const pendingCount       = accessRequests.filter((r) => r.status === "pending").length;
-  const suggestedQuestions = getSuggestedQuestions(activeTab, uploadedDatasetId, role);
-  const dataDictionary     = getDataDictionary(activeTab, uploadedDatasetId);
-  const registryInfo       = getRegistryInfo();
-  const roles              = getRoles();
+  /* ── Engine values hydrated from /api/query/* ── */
+  const [suggestedQuestions, setSuggestedQuestions] = useState([]);
+  const [dataDictionary, setDataDictionary]         = useState([]);
+  const [registryInfo, setRegistryInfo]             = useState({ totalDatasets: 0, datasets: [] });
+
+  const restrictions = getRestrictions(role, currentUser?.id);
+  const pendingCount = accessRequests.filter((r) => r.status === "pending").length;
+  const roles        = getRoles();
 
   /* ── Refs ── */
   const chatEndRef  = useRef(null);
@@ -170,6 +163,34 @@ export function AppProvider({ children }) {
     };
   }, [isAuthenticated, fetchAccessState]);
 
+  /* ── Hydrate registry/dictionary/suggestions whenever inputs change ── */
+  const refreshRegistry = useCallback(async () => {
+    if (!isAuthenticated) return;
+    try { setRegistryInfo(await queryApi.registry()); }
+    catch (err) { console.error("Failed to load registry:", err); }
+  }, [isAuthenticated]);
+
+  useEffect(() => { refreshRegistry(); }, [refreshRegistry]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let alive = true;
+    (async () => {
+      try {
+        const [{ suggestions }, { dictionary }] = await Promise.all([
+          queryApi.suggestions({ activeTab, datasetId: uploadedDatasetId }),
+          queryApi.dictionary({ activeTab, datasetId: uploadedDatasetId }),
+        ]);
+        if (!alive) return;
+        setSuggestedQuestions(suggestions ?? []);
+        setDataDictionary(dictionary ?? []);
+      } catch (err) {
+        console.error("Failed to load query metadata:", err);
+      }
+    })();
+    return () => { alive = false; };
+  }, [isAuthenticated, activeTab, uploadedDatasetId, role]);
+
   /* ── Auth functions (backend JWT) ── */
   const applySession = ({ user, token }) => {
     setToken(token);
@@ -207,7 +228,7 @@ export function AppProvider({ children }) {
     setCurrentUser(null);
     setIsAuthenticated(false);
     setRole("Owner");
-    setAuthView("login");
+    // The GuestRoute guard will redirect to /login on the next render.
   };
 
   /* ── Toast ── */
@@ -241,7 +262,9 @@ export function AppProvider({ children }) {
   const handleNewChat = () => {
     if (activeTab === "upload") {
       setUploadChat({ messages: [] });
-      if (uploadedDatasetId) removeDataset(uploadedDatasetId);
+      if (uploadedDatasetId) {
+        datasetApi.remove(uploadedDatasetId).catch(() => {}).finally(refreshRegistry);
+      }
       setUploadedFile(null);
       setUploadedDatasetId(null);
       setUploadedDataType("structured");
@@ -311,7 +334,12 @@ export function AppProvider({ children }) {
     }));
 
     try {
-      const result = await processQuery(text, role, context, activeTab, uploadedDatasetId, currentUser);
+      const result = await queryApi.run({
+        question: text,
+        activeTab,
+        datasetId: uploadedDatasetId ?? null,
+        context,
+      });
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
       if (result.type === "blocked") {
@@ -367,41 +395,42 @@ export function AppProvider({ children }) {
     }
   };
 
-  /* ── CSV / Excel upload ── */
+  /* ── CSV / Excel upload (Multer multipart → server profiles + persists) ── */
   const handleFileUpload = async (file, datasetType = "structured") => {
     if (!file) return;
     setIsLoading(true);
     setUploadChat({ messages: [] });
 
     try {
-      if (uploadedDatasetId) removeDataset(uploadedDatasetId);
+      // If a previous upload is in scope, remove it server-side.
+      if (uploadedDatasetId) {
+        try { await datasetApi.remove(uploadedDatasetId); } catch { /* ignore */ }
+      }
 
-      const entry = await registerCSV(file, {
-        name: file.name.replace(/\.[^.]+$/, ""),
-        type: datasetType,
-      });
+      const { dataset } = await datasetApi.upload(file, datasetType);
       setUploadedFile(file);
-      setUploadedDatasetId(entry.id);
-      setUploadedDataType(entry.type);
+      setUploadedDatasetId(dataset.id);
+      setUploadedDataType(dataset.type);
+      await refreshRegistry();
 
-      const colLines = entry.columns
+      const colLines = dataset.columns
         .slice(0, 12)
         .map((c) => `• **${c.name}** (${c.type})${c.description ? ": " + c.description : ""}`)
         .join("\n");
-      const extra = entry.columns.length > 12 ? `\n• …and ${entry.columns.length - 12} more columns` : "";
+      const extra = dataset.columns.length > 12 ? `\n• …and ${dataset.columns.length - 12} more columns` : "";
 
       setUploadChat({
         messages: [{
           role: "assistant",
-          content: `Successfully loaded **${entry.name}** — ${entry.rowCount.toLocaleString()} rows and ${entry.columns.length} columns detected.\n\n${colLines}${extra}\n\nAsk me anything about your data!`,
+          content: `Successfully loaded **${dataset.name}** — ${dataset.rowCount.toLocaleString()} rows and ${dataset.columns.length} columns detected.\n\n${colLines}${extra}\n\nAsk me anything about your data!`,
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         }]
       });
-    } catch {
+    } catch (err) {
       setUploadChat({
         messages: [{
           role: "assistant",
-          content: "Failed to load the file. Please make sure it's a valid CSV file.",
+          content: err?.message ?? "Failed to load the file. Please make sure it's a valid CSV file.",
           isError: true,
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         }]
@@ -426,7 +455,7 @@ export function AppProvider({ children }) {
     <AppContext.Provider
       value={{
         // Auth
-        isAuthenticated, isAuthLoading, currentUser, authView, setAuthView,
+        isAuthenticated, isAuthLoading, currentUser,
         login, signup, logout,
         // Tab
         activeTab, setActiveTab,

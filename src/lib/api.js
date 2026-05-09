@@ -69,3 +69,49 @@ export const accessApi = {
   resolveRequest:  (id, status) => apiFetch(`/api/access/requests/${id}`, { method: "PATCH", body: { status } }),
 };
 
+/* ─── Multipart upload (FormData, no JSON Content-Type) ──────────────── */
+async function postForm(path, formData) {
+  const headers = {};
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(`${API_URL}${path}`, { method: "POST", headers, body: formData });
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch { data = text; } }
+  if (!res.ok) {
+    const err = new Error(data?.error?.message ?? `Request failed (${res.status})`);
+    err.status = res.status;
+    err.details = data?.error?.details;
+    throw err;
+  }
+  return data;
+}
+
+export const datasetApi = {
+  list:   () => apiFetch("/api/datasets"),
+  get:    (id) => apiFetch(`/api/datasets/${id}`),
+  remove: (id) => apiFetch(`/api/datasets/${id}`, { method: "DELETE" }),
+  upload: (file, type = "structured") => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("type", type);
+    return postForm("/api/datasets", fd);
+  },
+};
+
+export const queryApi = {
+  run:         (payload) => apiFetch("/api/query", { method: "POST", body: payload }),
+  registry:    () => apiFetch("/api/query/registry"),
+  dictionary:  ({ activeTab = "company", datasetId } = {}) => {
+    const qs = new URLSearchParams({ activeTab });
+    if (datasetId) qs.set("datasetId", datasetId);
+    return apiFetch(`/api/query/dictionary?${qs}`);
+  },
+  suggestions: ({ activeTab = "company", datasetId } = {}) => {
+    const qs = new URLSearchParams({ activeTab });
+    if (datasetId) qs.set("datasetId", datasetId);
+    return apiFetch(`/api/query/suggestions?${qs}`);
+  },
+};
+

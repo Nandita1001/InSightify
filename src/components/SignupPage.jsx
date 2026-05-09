@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { Database, Mail, Lock, Eye, EyeOff, User, Shield, Users, FileText, BarChart3, ArrowRight, Check, X } from "lucide-react";
 import { useApp } from "../context/AppContext";
 
@@ -34,7 +35,7 @@ const ROLES = [
 ];
 
 export default function SignupPage() {
-  const { signup, setAuthView } = useApp();
+  const { signup } = useApp();
 
   /* ── Signup form state ── */
   const [name, setName] = useState("");
@@ -289,13 +290,13 @@ export default function SignupPage() {
 
           <p className="text-center text-sm mt-6" style={{ color: "#9ca3af" }}>
             Already have an account?{" "}
-            <button
-              onClick={() => setAuthView("login")}
+            <Link
+              to="/login"
               className="font-semibold hover:underline"
-              style={{ color: "#4f46e5", background: "none", border: "none", cursor: "pointer" }}
+              style={{ color: "#4f46e5" }}
             >
               Sign in
-            </button>
+            </Link>
           </p>
         </div>
       </div>

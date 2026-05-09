@@ -1,9 +1,10 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { Database, Mail, Lock, Eye, EyeOff, ArrowRight } from "lucide-react";
 import { useApp } from "../context/AppContext";
 
 export default function LoginPage() {
-  const { login, setAuthView } = useApp();
+  const { login } = useApp();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -139,13 +140,13 @@ export default function LoginPage() {
 
           <p className="text-center text-sm mt-6" style={{ color: "#9ca3af" }}>
             Don&apos;t have an account?{" "}
-            <button
-              onClick={() => setAuthView("signup")}
+            <Link
+              to="/signup"
               className="font-semibold hover:underline"
-              style={{ color: "#4f46e5", background: "none", border: "none", cursor: "pointer" }}
+              style={{ color: "#4f46e5" }}
             >
               Create one
-            </button>
+            </Link>
           </p>
         </div>
       </div>

@@ -1,49 +1,12 @@
 /**
- * geminiApi.js — LLM client (proxies through Insightify backend) + local fallback.
+ * queryFallbacks — deterministic regex-based parser + narrative templates.
  *
- * Groq is called by the backend at /api/llm/*. The frontend only submits
- * structured inputs (question, registry metadata, analysis results) — it never
- * sees the Groq API key or the prompt templates.
- *
- * Functions:
- *   parseQuery(question, registryMetadata, conversationContext) → analysis plan JSON
- *   generateNarrative(analysisResults, question, metricDefinitions) → narrative string
- *   fallbackParseQuery(question, registryMetadata) → analysis plan (no API needed)
- *   fallbackNarrative(analysisResults, question) → template-based narrative
- *   isApiAvailable() → boolean (tracks last backend call outcome)
- *
- * Rules:
- *  - Never send raw data rows — only column names + aggregated numbers.
- *  - All backend calls wrapped in try/catch — always fall back gracefully.
- *  - Simple client-side rate limiter: skip API after 14 calls / 60 s.
- *  - Strip markdown fences from LLM responses before JSON.parse.
+ * Used when the LLM call fails (Groq down, rate-limited, no key) so the query
+ * pipeline never crashes — it degrades to pattern matching + structured
+ * templates instead. Also exports stripMarkdownFences + normalizePlan +
+ * coerceSentimentPlan helpers used to post-process LLM output.
  */
 import { formatNumber, formatPercent } from "./analysisOps.js";
-import { llmApi } from "../lib/api.js";
-
-/* ═══════════════════════════════════════════════════════════
-   §0  CONSTANTS & RATE LIMITER
-═══════════════════════════════════════════════════════════ */
-
-
-
-const RATE_LIMIT = 14; // calls per window
-const RATE_WINDOW_MS = 60_000; // 60 seconds
-
-/** Timestamps (ms) of recent API calls */
-const _callLog = [];
-
-/** Returns true if we can make another API call right now. Also records the call. */
-function _reserveApiCall() {
-  const now = Date.now();
-  // Drop entries older than the window
-  while (_callLog.length > 0 && now - _callLog[0] > RATE_WINDOW_MS) {
-    _callLog.shift();
-  }
-  if (_callLog.length >= RATE_LIMIT) return false;
-  _callLog.push(now);
-  return true;
-}
 
 /* ═══════════════════════════════════════════════════════════
    §1  UTILITY HELPERS
@@ -56,7 +19,7 @@ function _reserveApiCall() {
  *  2. Find first { … } or [ … ] block via greedy regex
  *  3. Return cleaned text as-is (caller will try JSON.parse)
  */
-function stripMarkdownFences(text) {
+export function stripMarkdownFences(text) {
   // 1. Strip triple-backtick fences
   let cleaned = text
     .replace(/^```[a-z]*\s*/i, "")
@@ -71,14 +34,6 @@ function stripMarkdownFences(text) {
 
   return cleaned;
 }
-
-/**
- * Tracks whether the backend LLM is currently reachable.
- * Flipped by successful/failed parseQuery + generateNarrative calls, read by
- * isApiAvailable() so the UI's "AI-powered" badge reflects reality.
- */
-let _apiHealthy = true;
-
 
 /** Validate and coerce an analysis plan object so consumers never crash. */
 function _normalizeAnalysisList(rawAnalysis, rawIntent, question = "") {
@@ -104,7 +59,7 @@ function _normalizeAnalysisList(rawAnalysis, rawIntent, question = "") {
   return [...new Set(fromRaw)];
 }
 
-function _normalizePlan(raw, question = "") {
+export function normalizePlan(raw, question = "") {
   const INTENTS = [
     "breakdown", "comparison", "trend", "summary", "ranking", "anomaly",
     "correlation", "computed_metric", "text_search", "sentiment", "aggregate",
@@ -153,7 +108,7 @@ function _findFeedbackDataset(registryMetadata = []) {
   ) ?? null;
 }
 
-function _coerceSentimentPlan(plan, question, registryMetadata) {
+export function coerceSentimentPlan(plan, question, registryMetadata) {
   const feedbackDataset = _findFeedbackDataset(registryMetadata);
   const datasetColumns = feedbackDataset?.columns ?? [];
   const textCol = datasetColumns.find((c) => c.type === "text")?.name ?? "text";
@@ -188,175 +143,6 @@ function _coerceSentimentPlan(plan, question, registryMetadata) {
   };
 }
 
-/* ═══════════════════════════════════════════════════════════
-   §2  PUBLIC UTILITY
-═══════════════════════════════════════════════════════════ */
-
-/**
- * Returns true if the backend LLM has answered successfully recently.
- * Used by the trust panel to label results "AI-powered" vs "Local analysis".
- */
-export function isApiAvailable() {
-  return _apiHealthy;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   §3  parseQuery  (calls backend /api/llm/parse)
-═══════════════════════════════════════════════════════════ */
-
-/**
- * Parse a natural-language question into a structured analysis plan.
- * Sends { question, registry, context } to the backend; falls back to local
- * regex parsing if the backend is unreachable or the user is unauthenticated.
- *
- * @param {string}   question
- * @param {object[]} registryMetadata    — dataset summaries (no raw data)
- * @param {object[]} conversationContext — last N messages [{ role, content }]
- * @returns {Promise<object>} analysis plan
- */
-export async function parseQuery(question, registryMetadata, conversationContext = []) {
-  if (!_reserveApiCall()) {
-    return fallbackParseQuery(question, registryMetadata);
-  }
-
-  try {
-    const { raw } = await llmApi.parse({
-      question,
-      registry: registryMetadata ?? [],
-      context: (conversationContext ?? []).slice(-3),
-    });
-    _apiHealthy = true;
-    const json = JSON.parse(stripMarkdownFences(raw));
-    return _normalizePlan(_coerceSentimentPlan(json, question, registryMetadata), question);
-  } catch (err) {
-    _apiHealthy = false;
-    console.warn("[geminiApi] parseQuery fell back to local:", err.message);
-    return fallbackParseQuery(question, registryMetadata);
-  }
-}
-
-/* ═══════════════════════════════════════════════════════════
-   §4  generateNarrative  (calls backend /api/llm/narrative)
-═══════════════════════════════════════════════════════════ */
-
-/**
- * Generate a plain-English narrative for analysis results.
- * Sends { question, result, metadata } to the backend; falls back to
- * template-based narratives if the backend is unreachable.
- *
- * @param {object} analysisResults — { result, metadata } from analysisOps
- * @param {string} question
- * @param {object[]} [metricDefinitions] — data-dictionary entries (unused remote, kept for signature compat)
- * @returns {Promise<string>}
- */
-// eslint-disable-next-line no-unused-vars
-export async function generateNarrative(analysisResults, question, metricDefinitions = []) {
-  if (!_reserveApiCall()) {
-    return fallbackNarrative(analysisResults, question);
-  }
-
-  // Never ship error results to the LLM — local templates handle these cleanly.
-  if (
-    !analysisResults ||
-    !analysisResults.result ||
-    (Array.isArray(analysisResults.result) && analysisResults.result[0]?.error)
-  ) {
-    return fallbackNarrative(analysisResults, question);
-  }
-
-  try {
-    const { text } = await llmApi.narrative({
-      question,
-      result: analysisResults.result,
-      metadata: analysisResults.metadata ?? {},
-    });
-    _apiHealthy = true;
-    return text;
-  } catch (err) {
-    _apiHealthy = false;
-    console.warn("[geminiApi] narrative fell back to local:", err.message);
-    return fallbackNarrative(analysisResults, question);
-  }
-}
-
-/** Build a compact text summary of results to send to Gemini (no raw rows). */
-function _buildResultSummary(result, metadata) {
-  if (!result) return "(no results)";
-
-  const isCombinedResult = (
-    result &&
-    !Array.isArray(result) &&
-    !result.counts &&
-    !result.groups &&
-    !result.topKeywords &&
-    Object.values(result).some((value) =>
-      Array.isArray(value) ||
-      (value && typeof value === "object" && (value.counts || value.groups || value.topKeywords))
-    )
-  );
-
-  if (isCombinedResult) {
-    return Object.entries(result).map(([key, value]) => {
-      if (Array.isArray(value) && value.length > 0) {
-        const first = value[0];
-        if (first && typeof first === "object") {
-          const metricKey = Object.keys(first).find((k) => typeof first[k] === "number" && !k.startsWith("_"));
-          const labelKey = Object.keys(first).find((k) => typeof first[k] === "string" && !k.startsWith("_"));
-          if (metricKey) {
-            const label = key.charAt(0).toUpperCase() + key.slice(1);
-            return `${label} ${metricKey}: ${first[metricKey]}${labelKey ? ` (${first[labelKey]})` : ""}`;
-          }
-        }
-        return `${key}: ${JSON.stringify(value[0])}`;
-      }
-      if (value?.counts) {
-        const c = value.counts;
-        return `${key}: Positive ${c.positive}, Negative ${c.negative}, Neutral ${c.neutral}, Total ${c.total}`;
-      }
-      return `${key}: ${JSON.stringify(value)}`;
-    }).join("\n");
-  }
-
-  // sentimentScan — include groupRanking winner so Groq can name the specific group
-  if (result?.counts) {
-    const c = result.counts;
-    let summary = `Sentiment counts — Positive: ${c.positive}, Negative: ${c.negative}, Neutral: ${c.neutral}, Total: ${c.total}`;
-    if (result.groupRanking && result.groupRanking.length > 0) {
-      const worst = result.groupRanking[0];
-      const best  = result.groupRanking[result.groupRanking.length - 1];
-      summary += `\nGroup ranking (worst to best): ${result.groupRanking.map((g) => `${g.group}(neg:${g.negativeRate}%,pos:${g.positiveRate}%)`).join(", ")}`;
-      summary += `\nWorst group: "${worst.group}" (${worst.negativeRate}% negative, ${worst.negative} negative entries)`;
-      summary += `\nBest group: "${best.group}" (${best.positiveRate}% positive, ${best.positive} positive entries)`;
-    }
-    return summary;
-  }
-  // compare
-  if (result?.groups && result?.comparisons) {
-    const g = result.groups.slice(0, 4).map((g) => JSON.stringify(g)).join(", ");
-    const top = result.comparisons[0];
-    return `Groups: [${g}]${top ? `\nBiggest gap: ${top.groupA} vs ${top.groupB} on ${top.metricCol}: diff=${top.diff}` : ""}`;
-  }
-  // extractThemes
-  if (result?.topKeywords) {
-    return `Top keywords: ${result.topKeywords.slice(0, 8).map((k) => `${k.word}(${k.count})`).join(", ")}`;
-  }
-
-  // Array results
-  if (Array.isArray(result)) {
-    if (result[0]?.error) return `Error: ${result[0].error}`;
-
-    // Limit to first 8 rows, summarise key fields
-    return result.slice(0, 8).map((row) => {
-      const clean = {};
-      for (const [k, v] of Object.entries(row)) {
-        if (!k.startsWith("_")) clean[k] = v; // drop internal _ fields
-      }
-      return JSON.stringify(clean);
-    }).join("\n");
-  }
-
-  return JSON.stringify(result).slice(0, 600);
-}
 
 /* ═══════════════════════════════════════════════════════════
    §5  fallbackParseQuery  (LOCAL — no API)
@@ -957,7 +743,7 @@ export function fallbackParseQuery(question, registryMetadata) {
   const dimensions = [...new Set([primaryGroup].filter(Boolean))];
   const effectiveIntent = sentimentQuery ? "sentiment" : intent;
 
-  return _normalizePlan(_coerceSentimentPlan({
+  return normalizePlan(coerceSentimentPlan({
     intent: effectiveIntent,
     dataset: dataset?.id ?? dataset?.name ?? "",
     metrics,
