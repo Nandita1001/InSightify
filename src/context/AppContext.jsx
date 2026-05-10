@@ -48,7 +48,7 @@ export function AppProvider({ children }) {
   const [isLoading, setIsLoading]       = useState(false);
 
   /* ── Per-role, per-tab chat storage ── */
-  const [companyChats, setCompanyChats] = useState(() => {
+  const freshCompanyChats = () => {
     const initial = {};
     for (const r of getRoles()) {
       initial[r] = {
@@ -57,8 +57,9 @@ export function AppProvider({ children }) {
       };
     }
     return initial;
-  });
+  };
 
+  const [companyChats, setCompanyChats] = useState(freshCompanyChats);
   const [uploadChat, setUploadChat] = useState({ messages: [] });
 
   /* ── Derived chat values ── */
@@ -175,6 +176,10 @@ export function AppProvider({ children }) {
   useEffect(() => {
     if (!isAuthenticated) return;
     let alive = true;
+    // Clear synchronously so the prior tab's suggestions/dictionary don't
+    // flash for the ~100-300ms the async refetch is in flight.
+    setSuggestedQuestions([]);
+    setDataDictionary([]);
     (async () => {
       try {
         const [{ suggestions }, { dictionary }] = await Promise.all([
@@ -191,8 +196,34 @@ export function AppProvider({ children }) {
     return () => { alive = false; };
   }, [isAuthenticated, activeTab, uploadedDatasetId, role]);
 
+  /* ── Wipe all per-user UI state. Called on logout AND before applying a
+        new session, so the next user never inherits the previous user's
+        chat history, uploaded-dataset reference, or hydrated metadata. ── */
+  const resetSessionState = () => {
+    setCompanyChats(freshCompanyChats());
+    setUploadChat({ messages: [] });
+    setUploadedFile(null);
+    setUploadedDatasetId(null);
+    setUploadedDataType("structured");
+    setInput("");
+    setExpandedTrust(null);
+    setAccessRequests([]);
+    setSuggestedQuestions([]);
+    setDataDictionary([]);
+    setRegistryInfo({ totalDatasets: 0, datasets: [] });
+    setActiveTab("company");
+    setBellOpen(false);
+    setRoleOpen(false);
+    setRegistryOpen(false);
+    setDictOpen(false);
+    setRestrictOpen(false);
+    resetRestrictionIndex();
+  };
+
   /* ── Auth functions (backend JWT) ── */
   const applySession = ({ user, token }) => {
+    // Wipe any remnants of a previous session before installing the new one.
+    resetSessionState();
     setToken(token);
     setCurrentUser(user);
     setRole(user.role);
@@ -223,8 +254,7 @@ export function AppProvider({ children }) {
     try { await authApi.logout(); } catch { /* ignore — stateless JWT */ }
     disconnectSocket();
     setToken(null);
-    resetRestrictionIndex();
-    setAccessRequests([]);
+    resetSessionState();
     setCurrentUser(null);
     setIsAuthenticated(false);
     setRole("Owner");

@@ -1,0 +1,50 @@
+# Spin up the Insightify backend + a local MongoDB with one command:
+#
+#   cp server/.env.example server/.env   # then fill GROQ_API_KEY + JWT_ACCESS_SECRET
+#   docker compose up --build
+#
+# Backend is then reachable at http://localhost:4000.
+# Run the frontend separately with `npm run dev` from the project root,
+# or add another service here if you want it inside compose too.
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: insightify-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  server:
+    build: ./server
+    container_name: insightify-server
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      # `mongo` is the service name above; Docker's internal DNS resolves it.
+      MONGO_URI: mongodb://mongo:27017/insightify
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_ACCESS_TTL: 7d
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      GROQ_TEMPERATURE: ${GROQ_TEMPERATURE:-0.1}
+      RETRIEVAL_BACKEND: ${RETRIEVAL_BACKEND:-memory}
+      ATLAS_VECTOR_INDEX: ${ATLAS_VECTOR_INDEX:-vector_index}
+
+volumes:
+  mongo-data:

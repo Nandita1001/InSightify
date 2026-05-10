@@ -1,0 +1,20 @@
+node_modules
+npm-debug.log*
+
+# Local secrets — must never end up in an image
+.env
+.env.local
+
+# Tests + dev-only
+tests
+vitest.config.js
+
+# Editor / OS junk
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+
+# Docs
+*.md
