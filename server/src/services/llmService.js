@@ -46,13 +46,24 @@ These numbers are ALWAYS correct.
 
 Your job is ONLY to explain them clearly.
 
+You may also be given retrieved context rows from related datasets (e.g.
+customer feedback). These are unverified raw data, NOT computed results.
+
 STRICT RULES:
 - DO NOT invent any numbers
 - DO NOT assume missing data
-- ONLY use the numbers provided
+- ONLY use the numbers provided in "Computed Results"
 - If something is missing, say "Not available"
 - NEVER mention errors unless explicitly present in results
 - Keep it simple and natural
+
+CONTEXT ROW RULES:
+- Cite a context row ONLY when it materially supports the answer (e.g. the
+  user asked WHY a metric changed and the context provides a likely reason).
+- If the context rows are unrelated to the question, IGNORE them silently.
+  Do NOT mention that you saw context.
+- When you do cite a context row, reference it as "[Customer Feedback Row 7]"
+  using the dataset name + row number provided.
 
 FORMAT:
 
@@ -60,7 +71,7 @@ FORMAT:
 (1–2 sentences, direct answer with numbers)
 
 📊 Key Insight
-(1–2 sentences explaining why)
+(1–2 sentences explaining why. Cite context rows here when they help.)
 
 📁 Data Reference
 (List column names or fields used)
@@ -198,17 +209,31 @@ User question: "${question}"`;
   return { raw };
 }
 
+function formatContextBlock(context = []) {
+  if (!context || context.length === 0) return "";
+  const lines = context.map((c) => {
+    const ds = c.datasetName ? `${c.datasetName} ` : "";
+    return `[${ds}Row ${(c.rowIndex ?? 0) + 1}] ${c.text}`;
+  });
+  return `\n\nRetrieved Context (related rows from other datasets — unverified raw data):\n${lines.join("\n")}`;
+}
+
 /**
- * Generate a narrative for already-computed analysis results.
+ * Generate a narrative for already-computed analysis results, optionally
+ * augmented with retrieved context chunks from related datasets. The system
+ * prompt instructs the model to cite context only when it materially
+ * supports the answer.
  */
-export async function narrative({ result, metadata, question }) {
+export async function narrative({ result, metadata, question, context = [] }) {
   const summary = buildResultSummary(result, metadata);
+  const ctxBlock = formatContextBlock(context);
+
   const user = `
 User Question:
 "${question}"
 
 Computed Results:
-${summary}
+${summary}${ctxBlock}
 
 Explain these results clearly.
 `;

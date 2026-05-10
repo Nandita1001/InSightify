@@ -35,15 +35,20 @@ import { env } from "../config/env.js";
 
 /**
  * Coerce string ObjectIds to real ObjectIds for use inside $vectorSearch.filter,
- * which (unlike Mongoose's find()) doesn't auto-convert.
+ * which (unlike Mongoose's find()) doesn't auto-convert. Handles plain string
+ * values and `{ $in: [...] }` operator values.
  */
 function coerceFilter(filter = {}) {
   const out = {};
+  const toOid = (x) =>
+    typeof x === "string" && mongoose.isValidObjectId(x)
+      ? new mongoose.Types.ObjectId(x)
+      : x;
   for (const [k, v] of Object.entries(filter)) {
-    if (typeof v === "string" && mongoose.isValidObjectId(v)) {
-      out[k] = new mongoose.Types.ObjectId(v);
+    if (v && typeof v === "object" && Array.isArray(v.$in)) {
+      out[k] = { $in: v.$in.map(toOid) };
     } else {
-      out[k] = v;
+      out[k] = toOid(v);
     }
   }
   return out;

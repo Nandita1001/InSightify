@@ -1,4 +1,4 @@
-import { CheckCircle, Info, Zap } from "lucide-react";
+import { CheckCircle, Info, Zap, FileSearch } from "lucide-react";
 import { useApp } from "../context/AppContext";
 
 const INTENT_LABELS = {
@@ -101,6 +101,49 @@ export default function TrustPanel({ trust, idx }) {
               </div>
             )}
           </div>
+
+          {/* Cross-dataset RAG context — only shown when chunks were retrieved */}
+          {Array.isArray(trust.context) && trust.context.length > 0 && (
+            <div
+              className="mt-4 pt-3 border-t"
+              style={{ borderColor: "#bbf7d0" }}
+            >
+              <div className="flex items-center gap-1.5 mb-2">
+                <FileSearch size={12} style={{ color: "#166534" }} />
+                <span className="text-xs font-bold" style={{ color: "#166534" }}>
+                  Cross-dataset context
+                </span>
+                <span className="text-[10px] font-medium" style={{ color: "#6b7280" }}>
+                  {trust.context.length} of {trust.contextScanned ?? "?"} chunks above relevance threshold
+                </span>
+              </div>
+              <div className="space-y-1.5">
+                {trust.context.map((c, i) => (
+                  <div
+                    key={i}
+                    className="text-[11px] rounded-lg p-2"
+                    style={{ background: "#fff", border: "1px solid #d1fae5" }}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span
+                        className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold"
+                        style={{ background: "#dcfce7", color: "#166534" }}
+                      >
+                        {(c.score * 100).toFixed(0)}%
+                      </span>
+                      <span className="font-semibold" style={{ color: "#1a1a2e" }}>
+                        {c.datasetName || "Unknown dataset"}
+                      </span>
+                      <span style={{ color: "#9ca3af" }}>row {c.rowIndex + 1}</span>
+                    </div>
+                    <p className="leading-snug break-words" style={{ color: "#4b5563" }}>
+                      {c.text}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </>
