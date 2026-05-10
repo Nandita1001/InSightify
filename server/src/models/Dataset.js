@@ -25,6 +25,11 @@ const datasetSchema = new mongoose.Schema(
     rows:     { type: [mongoose.Schema.Types.Mixed], default: [] },
 
     fileName: { type: String, default: null },
+
+    // Dataset-level RBAC: empty = visible to all authenticated users,
+    // otherwise only the listed roles (Owner is always allowed regardless).
+    // Independent from User.role enum on purpose so it stays string-flexible.
+    allowedRoles: { type: [String], default: [] },
   },
   { timestamps: true, minimize: false }
 );
@@ -33,15 +38,16 @@ datasetSchema.index({ source: 1, ownerId: 1 });
 
 datasetSchema.methods.toListJSON = function () {
   return {
-    id:          this._id.toString(),
-    name:        this.name,
-    description: this.description,
-    source:      this.source,
-    type:        this.type,
-    rowCount:    this.rowCount,
-    columns:     this.columns,
-    fileName:    this.fileName,
-    uploadedAt:  this.createdAt,
+    id:           this._id.toString(),
+    name:         this.name,
+    description:  this.description,
+    source:       this.source,
+    type:         this.type,
+    rowCount:     this.rowCount,
+    columns:      this.columns,
+    fileName:     this.fileName,
+    uploadedAt:   this.createdAt,
+    allowedRoles: this.allowedRoles ?? [],
   };
 };
 

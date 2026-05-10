@@ -9,6 +9,7 @@ import llmRoutes from "./routes/llmRoutes.js";
 import accessRoutes from "./routes/accessRoutes.js";
 import datasetRoutes from "./routes/datasetRoutes.js";
 import queryRoutes from "./routes/queryRoutes.js";
+import adminRoutes from "./routes/adminRoutes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 
 export function createApp() {
@@ -25,6 +26,7 @@ export function createApp() {
   app.use("/api/access", accessRoutes);
   app.use("/api/datasets", datasetRoutes);
   app.use("/api/query", queryRoutes);
+  app.use("/api/admin", adminRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

@@ -12,6 +12,7 @@ import { Dataset } from "../models/Dataset.js";
 import { DocumentChunk } from "../models/DocumentChunk.js";
 import { ApiError } from "../utils/ApiError.js";
 import { embedBatch } from "./embeddingService.js";
+import { isOwner } from "../config/permissions.js";
 
 import { sampleSales }     from "../data/sampleSales.js";
 import { sampleCustomers } from "../data/sampleCustomers.js";
@@ -172,30 +173,98 @@ const BUILTINS = [
 ];
 
 /**
- * Idempotent seeder: creates any missing built-in datasets.
- * Safe to run on every server boot.
+ * Ensure RAG chunks exist for any company dataset that has at least one
+ * text-typed column (e.g. Customer Feedback's `text` column). Used so that
+ * cross-dataset synthesis ("why is revenue going down?") can retrieve
+ * explanatory context from built-in feedback datasets, not just uploads.
+ *
+ * Idempotent — skips datasets that already have chunks.
  */
-export async function seedBuiltIns() {
-  for (const def of BUILTINS) {
+async function ensureChunksForTextBearingBuiltIns() {
+  let docs;
+  try {
+    docs = await Dataset.find({ source: "company" });
+  } catch (err) {
+    console.warn(`[chunks] couldn't list built-ins for backfill — ${err.message}`);
+    return;
+  }
+
+  for (const doc of docs) {
+    const hasTextCol = (doc.columns ?? []).some((c) => c.type === "text");
+    if (!hasTextCol) continue;
+
+    const existing = await DocumentChunk.countDocuments({ datasetId: doc._id }).catch(() => null);
+    if (existing === null || existing > 0) continue;
+
     try {
-      const existing = await Dataset.findOne({ source: "company", name: def.name });
-      if (existing) continue;
-      await Dataset.create({
-        name:        def.name,
-        description: def.description,
-        source:      "company",
-        type:        def.type,
-        ownerId:     null,
-        rowCount:    def.rows.length,
-        columns:     profileRows(def.rows, def.hints),
-        rows:        def.rows,
-      });
-      console.log(`[datasets] seeded built-in: ${def.name}`);
+      await ingestChunksForDataset(doc);
     } catch (err) {
-      // Don't let a single transient Atlas error abort seeding the rest.
-      console.warn(`[datasets] skipped "${def.name}" — ${err.message}`);
+      console.warn(`[chunks] backfill failed for "${doc.name}" — ${err.message}`);
     }
   }
+}
+
+/**
+ * Idempotent seeder: creates only built-ins that don't already exist.
+ *
+ * Uses a single `distinct` query upfront so warm boots (when everything is
+ * already seeded) do exactly one round-trip. Reduces the surface area for
+ * Atlas's transient TLS drops on cold connections, which used to make this
+ * function spam scary-looking errors even though nothing was wrong.
+ *
+ * If the upfront query fails, we fall back to the per-dataset path with a
+ * single retry per create — so a flaky cluster eventually converges.
+ */
+export async function seedBuiltIns() {
+  let existingNames;
+  try {
+    const names = await Dataset.distinct("name", { source: "company" });
+    existingNames = new Set(names);
+  } catch (err) {
+    console.warn(`[datasets] couldn't list existing built-ins (${err.message}); will check per-dataset`);
+    existingNames = null;
+  }
+
+  const missing = existingNames
+    ? BUILTINS.filter((d) => !existingNames.has(d.name))
+    : BUILTINS;
+
+  for (const def of missing) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        // If we couldn't get the existing list, double-check before insert.
+        if (!existingNames) {
+          const dup = await Dataset.findOne({ source: "company", name: def.name });
+          if (dup) { lastErr = null; break; }
+        }
+        await Dataset.create({
+          name:        def.name,
+          description: def.description,
+          source:      "company",
+          type:        def.type,
+          ownerId:     null,
+          rowCount:    def.rows.length,
+          columns:     profileRows(def.rows, def.hints),
+          rows:        def.rows,
+        });
+        console.log(`[datasets] seeded built-in: ${def.name}`);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    if (lastErr) {
+      console.warn(`[datasets] could not seed "${def.name}" after retry — ${lastErr.message}`);
+    }
+  }
+
+  // Backfill chunks for any built-in that has a text column (e.g. Customer
+  // Feedback). Runs AFTER the seed loop so freshly-created datasets get
+  // chunked on first boot too. Idempotent.
+  await ensureChunksForTextBearingBuiltIns();
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -248,20 +317,39 @@ async function ingestChunksForDataset(doc) {
   return records.length;
 }
 
-/** List datasets visible to the user: all built-ins plus their own uploads. */
+/**
+ * Dataset-level RBAC check.
+ *
+ * - user-source datasets are private to the uploader. Owner does NOT bypass
+ *   this — uploads are personal data, not company data.
+ * - company-source datasets respect `allowedRoles`. Empty array = visible
+ *   to everyone with auth. Owner bypasses the role check on company datasets.
+ */
+function isDatasetVisibleToUser(doc, user) {
+  if (doc.source === "user") {
+    return doc.ownerId?.toString() === user._id.toString();
+  }
+  // company-source
+  if (isOwner(user.role)) return true;
+  const allowed = doc.allowedRoles ?? [];
+  return allowed.length === 0 || allowed.includes(user.role);
+}
+
+/** List datasets visible to the user, applying both source-level and role-level RBAC. */
 async function listFor(user) {
   const docs = await Dataset.find({
     $or: [{ source: "company" }, { source: "user", ownerId: user._id }],
   }).sort({ source: 1, createdAt: -1 });
-  return docs.map((d) => d.toListJSON());
+  return docs.filter((d) => isDatasetVisibleToUser(d, user)).map((d) => d.toListJSON());
 }
 
-/** Get one dataset (with rows). Built-ins are public; user datasets are owner-only. */
+/** Get one dataset (with rows). Returns 404-shaped error if not visible to the user. */
 async function getFor(user, id) {
   const doc = await Dataset.findById(id);
   if (!doc) throw ApiError.notFound("Dataset not found");
-  if (doc.source === "user" && doc.ownerId?.toString() !== user._id.toString()) {
-    throw ApiError.forbidden("Not your dataset");
+  if (!isDatasetVisibleToUser(doc, user)) {
+    // Same shape as not-found so we don't leak the existence of restricted datasets.
+    throw ApiError.notFound("Dataset not found");
   }
   return doc;
 }
@@ -327,4 +415,39 @@ async function uploadFor(user, file, { type } = {}) {
   return doc.toFullJSON();
 }
 
-export const datasetService = { listFor, getFor, getFullFor, removeFor, uploadFor, profileRows };
+/* ─── Admin operations (Owner-only at the route layer) ───────────────── */
+
+/**
+ * Update visibility settings for any dataset. Owner can:
+ *   - Promote a user upload to source=company (or demote back)
+ *   - Set allowedRoles (empty = visible to all roles)
+ */
+async function updateVisibility(id, { source, allowedRoles } = {}) {
+  const doc = await Dataset.findById(id);
+  if (!doc) throw ApiError.notFound("Dataset not found");
+
+  if (source !== undefined) {
+    if (!["company", "user"].includes(source)) {
+      throw ApiError.badRequest("source must be 'company' or 'user'");
+    }
+    doc.source = source;
+    // Promoted to company: clear ownerId so it's truly shared. Demoted back
+    // to user: leave ownerId as-is (it pre-dates the change).
+    if (source === "company") doc.ownerId = null;
+  }
+
+  if (allowedRoles !== undefined) {
+    if (!Array.isArray(allowedRoles)) {
+      throw ApiError.badRequest("allowedRoles must be an array of role strings");
+    }
+    doc.allowedRoles = allowedRoles.map(String);
+  }
+
+  await doc.save();
+  return doc.toListJSON();
+}
+
+export const datasetService = {
+  listFor, getFor, getFullFor, removeFor, uploadFor, profileRows,
+  updateVisibility, isDatasetVisibleToUser,
+};

@@ -1,16 +1,17 @@
 /**
- * Role-Based Access Control matrix.
+ * Default Role-Based Access Control matrix — used ONLY as the seed when the
+ * RolePermission collection is empty (first boot). At runtime, the
+ * authoritative matrix lives in Mongo and is editable via /api/admin/permissions.
  *
- * Source of truth for which dataset columns each role is restricted from.
- * Per-user grants are stored in the AccessRequest collection (status="approved")
- * and combined with this matrix at read time inside accessService.
+ * To change permissions for an existing deployment: use the admin API.
+ * To change the bootstrap defaults for a fresh deployment: edit this file.
  */
 
 import { ROLES } from "../models/User.js";
 
 export { ROLES };
 
-const ROLE_PERMISSIONS = {
+export const DEFAULT_ROLE_PERMISSIONS = {
   Owner: { restricted: [], canApprove: true },
 
   "Finance Team": {
@@ -56,14 +57,11 @@ const ROLE_PERMISSIONS = {
   },
 };
 
-export function getRoleRestrictions(role) {
-  return ROLE_PERMISSIONS[role]?.restricted ?? [];
-}
-
-export function canApprove(role) {
-  return ROLE_PERMISSIONS[role]?.canApprove ?? false;
-}
-
+/**
+ * `isOwner(role)` is the only sync helper that survives — it's a constant
+ * predicate not tied to mutable permissions. For everything else, use
+ * `permissionsService` (async, Mongo-backed, cached).
+ */
 export function isOwner(role) {
   return role === "Owner";
 }

@@ -7,7 +7,8 @@
  */
 
 import { AccessRequest } from "../models/AccessRequest.js";
-import { getRoleRestrictions, isOwner } from "../config/permissions.js";
+import { isOwner } from "../config/permissions.js";
+import { getRoleRestrictions } from "./permissionsService.js";
 import { ApiError } from "../utils/ApiError.js";
 import { broadcast } from "./realtime.js";
 
@@ -26,7 +27,7 @@ async function listRequests(currentUser) {
  * columns granted via approved requests for this user.
  */
 async function getRestrictionsFor(currentUser) {
-  const baseline = getRoleRestrictions(currentUser.role);
+  const baseline = await getRoleRestrictions(currentUser.role);
   if (baseline.length === 0) return [];
 
   const approved = await AccessRequest.find({

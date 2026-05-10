@@ -14,7 +14,10 @@ import { Dataset } from "../models/Dataset.js";
 import { datasetService } from "./datasetService.js";
 import { llmService } from "./llmService.js";
 import { groqChat, isGroqConfigured } from "./groqService.js";
-import { getRoleRestrictions, isOwner } from "../config/permissions.js";
+import { retrieve } from "./retrievalService.js";
+import { isOwner } from "../config/permissions.js";
+import { getRoleRestrictions } from "./permissionsService.js";
+import { getDictionary } from "./dictionaryService.js";
 import { AccessRequest } from "../models/AccessRequest.js";
 
 import {
@@ -47,7 +50,6 @@ import {
   fallbackNarrative,
 } from "./queryFallbacks.js";
 
-import { DATA_DICTIONARY } from "../config/dataDictionary.js";
 
 /* ═══════════════════════════════════════════════════════════
    REQUEST-SCOPED HELPERS  (replaces module-level dataRegistry + accessControl)
@@ -65,11 +67,11 @@ async function loadRequestRegistry(user, activeTab, datasetId) {
   if (activeTab === "upload" && datasetId) {
     const doc = await Dataset.findById(datasetId);
     if (!doc) return [];
-    if (doc.source === "user" && doc.ownerId?.toString() !== user._id.toString()) return [];
+    if (!datasetService.isDatasetVisibleToUser(doc, user)) return [];
     return [_docToEntry(doc)];
   }
   const docs = await Dataset.find({ source: "company" });
-  return docs.map(_docToEntry);
+  return docs.filter((d) => datasetService.isDatasetVisibleToUser(d, user)).map(_docToEntry);
 }
 
 function _docToEntry(doc) {
@@ -92,7 +94,7 @@ function _docToEntry(doc) {
 async function checkAccessForUser(user, requiredColumns) {
   if (isOwner(user.role)) return { allowed: true, blockedColumns: [] };
 
-  const baseline = getRoleRestrictions(user.role);
+  const baseline = await getRoleRestrictions(user.role);
   if (baseline.length === 0) return { allowed: true, blockedColumns: [] };
 
   const approved = await AccessRequest.find({
@@ -121,7 +123,7 @@ async function checkAccessForUser(user, requiredColumns) {
 
 async function getRestrictionsForUser(user) {
   if (isOwner(user.role)) return [];
-  const baseline = getRoleRestrictions(user.role);
+  const baseline = await getRoleRestrictions(user.role);
   if (baseline.length === 0) return [];
   const approved = await AccessRequest.find({
     userId: user._id,
@@ -166,6 +168,12 @@ async function callGroqForUnstructured(prompt) {
 }
 
 const RAG_TOP_K = 10;
+
+// Cross-dataset context retrieval (always-on RAG for structured queries).
+// Score threshold tuned for all-MiniLM-L6-v2 cosine similarity — relevant
+// chunks score 0.4+, noise sits below 0.3.
+const CONTEXT_TOP_K     = 6;
+const CONTEXT_THRESHOLD = 0.35;
 
 /**
  * RAG-backed handler for unstructured datasets.
@@ -350,9 +358,10 @@ function formatForChart(result, chartType, intent) {
   }
 }
 
-function getMetricDefinitions(columns) {
-  const lowerCols = columns.map(c => c.toLowerCase());
-  return DATA_DICTIONARY.filter(d => lowerCols.includes(d.name.toLowerCase()));
+async function getMetricDefinitions(columns) {
+  const lowerCols = (columns ?? []).map((c) => String(c).toLowerCase());
+  const dict = await getDictionary();
+  return dict.filter((d) => lowerCols.includes(d.name.toLowerCase()));
 }
 
 function isSentimentQuestion(question = "") {
@@ -676,17 +685,18 @@ export async function processQuery({
         return fallbackParseQuery(q, registryMeta);
       }
     };
-    const generateNarrative = async (analysisResults, q) => {
+    const generateNarrative = async (analysisResults, q, context = []) => {
       try {
         const { text } = await llmService.narrative({
           question: q,
           result: analysisResults.result,
           metadata: analysisResults.metadata ?? {},
+          context,
         });
         return text;
       } catch (err) {
         console.warn("[queryService] LLM narrative failed, falling back:", err.message);
-        return fallbackNarrative(analysisResults, q);
+        return fallbackNarrative(analysisResults, q, context);
       }
     };
     const isApiAvailable = () => isGroqConfigured();
@@ -909,16 +919,60 @@ export async function processQuery({
       ? analysisResult
       : { result: combinedResults, metadata: allMetadata };
 
+    /* ── Step 6.5: Cross-dataset context retrieval (always-on RAG) ──
+       Pulls explanatory context from any unstructured chunks the user can
+       see. Relevance threshold drops irrelevant chunks so the LLM only
+       sees them when they actually relate to the question. RBAC: skip
+       datasets that contain columns the user is restricted from. */
+    let contextChunks = [];
+    let contextScanned = 0;
+    try {
+      const userRestrictedSet = new Set(
+        (await getRestrictionsForUser(user)).map((r) => r.col.toLowerCase())
+      );
+
+      // Datasets visible to this user that don't contain a restricted column.
+      const visible = await datasetService.listFor(user);
+      const allowedIds = visible
+        .filter((d) =>
+          !(d.columns ?? []).some((c) =>
+            userRestrictedSet.has(String(c.name).toLowerCase())
+          )
+        )
+        .map((d) => d.id);
+
+      if (allowedIds.length > 0) {
+        const r = await retrieve(
+          { datasetId: { $in: allowedIds } },
+          question,
+          CONTEXT_TOP_K
+        );
+        contextScanned = r.totalScanned;
+        contextChunks = r.chunks
+          .filter((c) => c.score >= CONTEXT_THRESHOLD)
+          .map((c) => ({
+            rowIndex:    c.rowIndex,
+            datasetId:   c.datasetId?.toString?.() ?? c.datasetId,
+            datasetName: visible.find((d) => d.id === (c.datasetId?.toString?.() ?? c.datasetId))?.name ?? "",
+            text:        c.text,
+            score:       +Number(c.score).toFixed(4),
+          }));
+      }
+    } catch (err) {
+      console.warn("[queryService] context retrieval failed (continuing without):", err.message);
+    }
+
     /* ── Step 7: Generate narrative ── */
     const activePlan = finalPlan;
     let narrative = "";
-    const metricDefs = getMetricDefinitions(allMetadata.columnsUsed);
+    const metricDefs = await getMetricDefinitions(allMetadata.columnsUsed);
     try {
-      narrative = await generateNarrative(analysisResult, question, metricDefs);
+      narrative = await generateNarrative(analysisResult, question, contextChunks);
+      void metricDefs; // reserved for future per-metric prompt enrichment
     } catch {
-      narrative = fallbackNarrative(analysisResult, question);
+      narrative = fallbackNarrative(analysisResult, question, contextChunks);
     }
-    if (!narrative) narrative = fallbackNarrative(analysisResult, question);
+    if (!narrative) narrative = fallbackNarrative(analysisResult, question, contextChunks);
 
     const aiPowered = isApiAvailable();
 
@@ -946,7 +1000,9 @@ export async function processQuery({
         source: activeTab === "company"
           ? `Company Database → ${resolvedDatasets.map(d => d.name).join(", ")}`
           : `Uploaded File → ${resolvedDatasets[0]?.name}`,
-        aiPowered
+        aiPowered,
+        context: contextChunks,            // [{rowIndex, datasetName, text, score}]
+        contextScanned,                    // total chunks considered before threshold
       },
       rawResult: analysisResult.result
     };
@@ -962,88 +1018,84 @@ export async function processQuery({
    EXTRA EXPORTS
 ═══════════════════════════════════════════════════════════ */
 
-export async function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owner") {
-  if (activeTab === "company") {
-    // Role-specific suggestions — avoid suggesting columns that are restricted
-    const isMarketing = role === "Marketing Team";
-    const isHR        = role === "HR Team";
-    const isFinance   = role === "Finance Team";
+/**
+ * Auto-generate query suggestions from a dataset's column profile. The
+ * column types (numeric / categorical / date / text) determine which
+ * question shapes apply, and the user's restrictions are filtered out so
+ * we don't suggest queries the server would just block.
+ *
+ * Returns up to `max` suggestion strings.
+ */
+function generateSuggestionsForDataset(dataset, restrictedSet, max = 4) {
+  const cols = (dataset.columns ?? []).filter(
+    (c) => !restrictedSet.has(String(c.name).toLowerCase())
+  );
 
-    const salesQs = [
-      "What is the revenue by region?",
-      "How did revenue trend month over month?",
-      "Which channel generates the most revenue?",
-      "What is the breakdown of units sold by product?",
-    ];
+  const numericCols = cols.filter((c) => c.type === "numeric");
+  const catCols     = cols.filter((c) => c.type === "categorical");
+  const textCols    = cols.filter((c) => c.type === "text");
+  const dateCols    = cols.filter((c) => c.type === "date");
 
-    const customerQs = [
-      "How is churn trending by week?",
-      "Show signups vs churn over time",
-      "Which week had the highest active users?",
-      isFinance ? null : "How did NPS change over time?",
-      "Which channel has the most signups?",
-    ].filter(Boolean);
-
-    const costQs = isHR
-      ? [
-          "Which department has the highest headcount?",
-          "Show headcount breakdown by department",
-        ]
-      : isMarketing
-      ? [
-          "Which department has the highest headcount?",
-        ]
-      : [
-          "Which department had the highest spend in Q1?",
-          "Compare Q1, Q2, Q3, Q4 spending across departments",
-          "Which department has the highest headcount?",
-          "Show the spending breakdown by category",
-        ];
-
-    const feedbackQs = (isFinance || isHR)
-      ? ["Which month had the worst customer feedback?"]
-      : [
-          "Which month had the worst customer feedback?",
-          "What are the main complaints in customer feedback?",
-        ];
-
-    return [...salesQs.slice(0, 1), ...customerQs.slice(0, 1), ...costQs.slice(0, 1), ...feedbackQs.slice(0, 1)];
+  const out = [];
+  if (numericCols.length > 0 && catCols.length > 0) {
+    out.push(`What is the total ${numericCols[0].name} by ${catCols[0].name}?`);
   }
+  if (dateCols.length > 0 && numericCols.length > 0) {
+    out.push(`How did ${numericCols[0].name} trend over time?`);
+  }
+  if (numericCols.length > 1) {
+    out.push(`Compare ${numericCols[0].name} and ${numericCols[1].name}`);
+  }
+  if (textCols.length > 0) {
+    out.push(`What are the main themes in ${textCols[0].name}?`);
+  }
+  if (numericCols.length > 0 && out.length < max) {
+    out.push(`What is the average ${numericCols[0].name}?`);
+  }
+  return out.slice(0, max);
+}
+
+/**
+ * Server-generated query suggestions. Replaces the old hand-written prompts.
+ * Walks the user's accessible datasets, generates 1-2 prompts per dataset
+ * based on the column types, and skips columns the user is restricted from.
+ *
+ * Plug-and-play: works for any dataset shape, no per-schema tuning required.
+ */
+export async function getSuggestedQuestions(activeTab, uploadedDatasetId, role = "Owner") {
+  // Use a fake user shape since the existing API only passes role; fetch the
+  // role's restricted columns to avoid suggesting blocked queries.
+  const baseline = await getRoleRestrictions(role);
+  const restrictedSet = new Set(baseline.map((r) => String(r.col).toLowerCase()));
 
   if (activeTab === "upload" && uploadedDatasetId) {
-    const doc = await Dataset.findById(uploadedDatasetId).select("columns");
+    const doc = await Dataset.findById(uploadedDatasetId).select("columns name");
     if (!doc) return [];
+    return generateSuggestionsForDataset(doc, restrictedSet, 5);
+  }
 
-    const numericCols = doc.columns.filter((c) => c.type === "numeric");
-    const catCols     = doc.columns.filter((c) => c.type === "categorical");
-    const textCols    = doc.columns.filter((c) => c.type === "text");
-    const dateCols    = doc.columns.filter((c) => c.type === "date");
+  if (activeTab === "company") {
+    // Walk all company datasets and generate ~2 per dataset.
+    const docs = await Dataset.find({ source: "company" }).select("columns name allowedRoles source");
+    const visible = docs.filter(
+      (d) => isOwner(role) || (d.allowedRoles ?? []).length === 0 || (d.allowedRoles ?? []).includes(role)
+    );
 
-    const suggested = [];
-    if (numericCols.length > 0 && catCols.length > 0) {
-      suggested.push(`What is the total ${numericCols[0].name} by ${catCols[0].name}?`);
-      suggested.push(`Show top 5 ${catCols[0].name} by ${numericCols[0].name}`);
+    const out = [];
+    for (const d of visible) {
+      const ds = generateSuggestionsForDataset(d, restrictedSet, 2);
+      out.push(...ds);
+      if (out.length >= 6) break;
     }
-    if (dateCols.length > 0 && numericCols.length > 0) {
-      suggested.push(`How did ${numericCols[0].name} trend over time?`);
-    }
-    if (numericCols.length > 1) {
-      suggested.push(`Compare ${numericCols[0].name} and ${numericCols[1].name}`);
-    }
-    if (textCols.length > 0) {
-      suggested.push(`What are the main themes in ${textCols[0].name}?`);
-    }
-    if (numericCols.length > 0) {
-      suggested.push(`What is the average ${numericCols[0].name}?`);
-    }
-    return suggested.slice(0, 5);
+    return out.slice(0, 6);
   }
 
   return [];
 }
 
 export async function getDataDictionary(activeTab, uploadedDatasetId) {
-  const predefined = DATA_DICTIONARY;
+  // Pull global entries plus dataset-scoped entries when querying a specific dataset.
+  const predefined = await getDictionary(uploadedDatasetId);
 
   if (activeTab === "company") return predefined;
 

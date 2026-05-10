@@ -1,17 +1,13 @@
 /**
- * dataDictionary.js — Metric & Column Definitions
+ * Default Metric & Column Definitions — used ONLY as the seed when the
+ * DictionaryEntry collection is empty (first boot). At runtime, the
+ * dictionary lives in Mongo and is editable via /api/admin/dictionary.
  *
- * Covers ALL columns from the 4 actual company datasets:
- *
- *  Sales Performance:   month, region, product, channel, revenue, units, cost, returns, ad_spend
- *  Customer Behavior:   week, signups, churn, active_users, avg_handle_time, nps, tickets, resolution_rate, channel
- *  Financial Reports:   department, category, Q1, Q2, Q3, Q4, headcount
- *  Customer Feedback:   date, region, text
- *
- * Name matching is case-insensitive in getMetricDefinitions().
+ * To change definitions for an existing deployment: use the admin API.
+ * To change the bootstrap defaults for a fresh deployment: edit this file.
  */
 
-export const DATA_DICTIONARY = [
+export const DEFAULT_DICTIONARY = [
   /* ══ Sales Performance ══ */
   { name: "month",    def: "Calendar month of the sales period (Jan–Jun)" },
   { name: "region",   def: "Sales territory: North, South, East, or West" },

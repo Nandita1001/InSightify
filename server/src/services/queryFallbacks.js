@@ -148,40 +148,9 @@ export function coerceSentimentPlan(plan, question, registryMetadata) {
    §5  fallbackParseQuery  (LOCAL — no API)
 ═══════════════════════════════════════════════════════════ */
 
-/* ── Column synonym map: user term → actual column name ── */
-const COLUMN_SYNONYMS = {
-  sales:         "revenue",
-  income:        "revenue",
-  earnings:      "revenue",
-  profit:        "revenue",
-  users:         "active_users",
-  "active users": "active_users",
-  customers:     "active_users",
-  attrition:     "churn",
-  "churn rate":  "churn",
-  cancellations: "churn",
-  "sign ups":    "signups",
-  "new users":   "signups",
-  registrations: "signups",
-  spend:         "ad_spend",
-  spending:      "ad_spend",
-  advertising:   "ad_spend",
-  expenses:      "cost",
-  costs:         "cost",
-  employees:     "headcount",
-  staff:         "headcount",
-  "team size":   "headcount",
-  satisfaction:  "nps",
-  "handle time": "avg_handle_time",
-  response:      "resolution_rate",
-  period:        "month",
-  time:          "month",
-};
-
-/** Map a user-provided term to an actual column name using synonyms. */
-function _synonymResolve(term) {
-  return COLUMN_SYNONYMS[term.toLowerCase()] ?? null;
-}
+/* COLUMN_SYNONYMS removed: was schema-coupled (sales→revenue, attrition→churn)
+   and only used by the fallback regex parser when the LLM is down. The LLM
+   handles term mapping fluently and the fallback path is rarely hit. */
 
 /* ── Intent keyword tables ── */
 const INTENT_RULES = [
@@ -372,14 +341,9 @@ function _findMentionedColumns(question, dataset) {
     if (lower.includes(c.name.toLowerCase())) found.add(c.name);
   }
 
-  // 2. Synonym match: if user says "sales", map to "revenue" if it exists
-  for (const [synonym, colName] of Object.entries(COLUMN_SYNONYMS)) {
-    if (lower.includes(synonym)) {
-      const match = cols.find((c) => c.name.toLowerCase() === colName.toLowerCase());
-      if (match) found.add(match.name);
-    }
-  }
-
+  // Synonym matching used to live here (sales→revenue, etc.). Removed —
+  // schema-coupled and the LLM path handles term mapping. The fallback
+  // regex parser is now strict on direct column-name matches.
   return [...found];
 }
 
@@ -790,7 +754,11 @@ function _wrapStructured(finalAnswer, keyInsight, dataRef, notes) {
  * @param {string} question
  * @returns {string}
  */
-export function fallbackNarrative(analysisResults, question) {
+// eslint-disable-next-line no-unused-vars
+export function fallbackNarrative(analysisResults, question, _context = []) {
+  // Context is accepted for signature parity with the LLM narrative; the
+  // template path doesn't try to weave retrieved rows into prose. The trust
+  // panel still shows the chunks separately.
   const { result, metadata } = analysisResults ?? {};
   const method = metadata?.method ?? "";
   const colsUsed = (metadata?.columnsUsed ?? []).join(", ") || "unknown fields";
