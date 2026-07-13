@@ -11,9 +11,10 @@ export async function connectDB() {
     try {
       await mongoose.connect(env.MONGO_URI, {
         autoIndex: env.NODE_ENV !== "production",
-        serverSelectionTimeoutMS: 10_000,
-        socketTimeoutMS: 45_000,
-        heartbeatFrequencyMS: 10_000,
+        serverSelectionTimeoutMS: 20_000,
+        socketTimeoutMS: 60_000,
+        heartbeatFrequencyMS: 20_000,
+        maxPoolSize: 1,
         retryWrites: true,
         retryReads:  true,
       });
