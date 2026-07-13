@@ -24,3 +24,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# docker (excluded from this repo)
+docker-compose.yml
+Dockerfile
+.dockerignore
